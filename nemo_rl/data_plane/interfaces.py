@@ -150,6 +150,9 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     graveyard_max_bytes: int = 4294967296
     placement: dict[str, Any] = Field(default_factory=lambda: {"policy": "local_first"})
     store: dict[str, Any] = Field(default_factory=lambda: {"kind": "unit"})
+    # SSD tier: {enabled, dir, staging_bytes, pickup_s, demote_after_s};
+    # see tq_nixl.ssd_config. Checkpointing the store with it on is not supported.
+    ssd: dict[str, Any] = Field(default_factory=lambda: {"enabled": False})
     nixl: dict[str, Any] = Field(
         default_factory=lambda: {"backend_name": "UCX", "backend_init_params": {}}
     )

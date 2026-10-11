@@ -64,6 +64,7 @@ from transfer_queue.storage.managers.base import KVStorageManager, StorageManage
 from nemo_rl.data_plane.adapters import tq_nixl_checkpoint
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import (
+    BUSY_RETRY_MAX_S,
     LostBlobs,
     TransferFailed,
     UnitSlabStore,
@@ -122,6 +123,42 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
         )
     op_timeout_s = float(cfg.get("op_timeout_s", 2 * timeout_s))
     return timeout_s, read_pin_s, op_timeout_s
+
+
+def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Unit kwargs for the SSD tier, or None when ``ssd.enabled`` is off.
+
+    ``ssd: {enabled, dir, staging_bytes, pickup_s, demote_after_s}``: each unit
+    demotes committed blobs to files under ``dir`` (node-local NVMe) when its
+    slab is full, and stages them back into ``staging_bytes`` carved from its
+    slab. ``demote_after_s`` (off by default) also demotes every blob that
+    old, to exercise the tier without a full slab.
+    """
+    ssd = _as_dict(cfg.get("ssd") or {})
+    if not ssd.get("enabled", False):
+        return None
+    if _as_dict(cfg.get("store") or {}).get("kind", "unit") != "unit":
+        raise ValueError("NixlStore ssd.enabled needs store.kind='unit'")
+    slab = int(cfg.get("unit_slab_bytes", 1 << 30))
+    staging = int(ssd.get("staging_bytes", slab // 4))
+    pickup_s = float(ssd.get("pickup_s", 10.0))
+    if not 0 < staging < slab:
+        raise ValueError(
+            f"NixlStore ssd.staging_bytes={staging} must be in (0, unit_slab_bytes={slab})"
+        )
+    if pickup_s < 2 * BUSY_RETRY_MAX_S:
+        # A reader polls a pending blob every <= BUSY_RETRY_MAX_S; a staged copy
+        # must not become evictable between two of its polls (design §4.2).
+        raise ValueError(
+            f"NixlStore ssd.pickup_s={pickup_s} must be >= {2 * BUSY_RETRY_MAX_S}"
+        )
+    after = ssd.get("demote_after_s")  # testing: demote every blob this old
+    return {
+        "ssd_dir": str(ssd.get("dir", "/tmp/nvdp-ssd")),
+        "staging_bytes": staging,
+        "pickup_s": pickup_s,
+        "demote_after_s": None if after is None else float(after),
+    }
 
 
 def _check_finite(tag: str, keys: list[str], values: list[Any]) -> None:
@@ -240,6 +277,7 @@ class NixlKVClient(StorageKVClient):
                 ),
                 node_id=ray.get_runtime_context().get_node_id(),
                 timeout_s=self.timeout_s,
+                ssd=ssd_config(cfg) is not None,
             )
         else:
             self.store = make_store(
@@ -562,6 +600,7 @@ def shutdown(conf_or_backend_cfg: Any) -> None:
 def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
     cfg = _as_dict(conf.backend.NixlStore)
     _, read_pin_s, _ = check_timeouts(cfg)  # fail before starting any actor
+    ssd = ssd_config(cfg) or {}
     namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
     dir_name = cfg.get("directory_name", "BlobDirectory")
     nixl_cfg = _as_dict(cfg.get("nixl") or {})
@@ -607,6 +646,7 @@ def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
                 numa_mode=str(cfg.get("numa", "auto")),
                 numa_index=numa_index,
                 directory=directory,
+                **ssd,
             )
             units.append(unit)
             handles[_unit_name(i)] = unit

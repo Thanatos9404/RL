@@ -90,6 +90,12 @@ def remaining(deadline: float | None, cap: float) -> float:
     return min(cap, left)
 
 
+def busy_wait(deadline: float | None, backoff: float) -> float:
+    """Sleep one Busy backoff (bounded by ``deadline``); return the next one."""
+    time.sleep(remaining(deadline, backoff))
+    return min(2 * backoff, BUSY_RETRY_MAX_S)
+
+
 # (off_in_blob, nbytes, local_addr)
 ReadRange = tuple[int, int, int]
 
@@ -158,8 +164,13 @@ class UnitSlabStore:
         placement: Placement,
         node_id: str,
         timeout_s: float,
+        ssd: bool = False,
     ) -> None:
         self.ep = ep
+        # SSD tier on the units: a put commits after its WRITE is DONE, and
+        # every read is pinned (a demoted blob's slab region is reused without
+        # the read_pin_s quarantine hinted reads rely on).
+        self.ssd = ssd
         self.directory = directory
         self.namespace = namespace
         self.placement = placement
@@ -229,6 +240,25 @@ class UnitSlabStore:
                 if u != LOST:
                     self._blob_unit[b] = int(u)
         return {b: self._blob_unit[b] for b in blob_ids if b in self._blob_unit}
+
+    def _locate(
+        self, blob_ids: list[str], metas: dict[str, dict[str, Any]]
+    ) -> dict[str, int]:
+        """Unit of each blob: its live hint (any writer), else cache / directory.
+
+        The directory only knows restored blobs, so a blob another client wrote
+        is found through its meta.
+        """
+        loc: dict[str, int] = {}
+        rest = []
+        for b in blob_ids:
+            m = metas.get(b) or {}
+            if self._hint_live(m):
+                loc[b] = int(m["u"])
+            else:
+                rest.append(b)
+        loc.update(self._where(rest))
+        return loc
 
     # -- BlobStore
     def put(
@@ -307,16 +337,18 @@ class UnitSlabStore:
                     )
                     errs.append(e)
                     continue
+                if self.ssd and not self._commit(u, blob_id, deadline, errs):
+                    continue
                 self._blob_unit[blob_id] = unit_id
-                return blob_id, {
+                hint = {
                     "u": unit_id,
                     "so": int(off),
                     "z": int(nbytes),
                     "g": self._gen(unit_id),
                 }
+                return blob_id, hint
             if any(isinstance(e, DataPlaneBusy) for e in errs):
-                time.sleep(remaining(deadline, backoff))
-                backoff = min(2 * backoff, BUSY_RETRY_MAX_S)
+                backoff = busy_wait(deadline, backoff)
                 continue
             if not refreshed:
                 self._refresh_units()  # membership may have changed; one retry
@@ -329,6 +361,30 @@ class UnitSlabStore:
                 f"no unit took {nbytes} B: {errs[-1] if errs else 'no units'}",
                 in_flight=any(getattr(e, "in_flight", False) for e in errs),
             )
+
+    def _commit(
+        self, u: dict[str, Any], blob_id: str, deadline: float | None, errs: list
+    ) -> bool:
+        """Awaited commit (design §4.1): the blob may be demoted only after it.
+
+        On failure the blob is never published; the unit drops it on abort.
+        """
+        ok = False
+        try:
+            ok = self.ctl.call(
+                u["zmq"],
+                "commit",
+                timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
+                blob_id=blob_id,
+            )
+            if not ok:
+                errs.append(TransferError(f"unit {u['unit_id']} lost the blob"))
+        except (TransferError, LostBlobs, DataPlaneBusy) as e:
+            errs.append(e)
+        finally:
+            if not ok:  # every failure, including a deadline: free the region
+                self.ctl.notify(u["zmq"], "abort", blob_id=blob_id, in_flight=False)
+        return bool(ok)
 
     def read(
         self,
@@ -350,7 +406,14 @@ class UnitSlabStore:
         fast: dict[int, list[str]] = {}
         for b, ranges in requests.items():
             m = metas.get(b) or {}
-            if scratch is not None and "so" in m and "z" in m and self._hint_live(m):
+            # SSD tier: blobs may move to disk, so every read is pinned.
+            if (
+                scratch is not None
+                and not self.ssd
+                and "so" in m
+                and "z" in m
+                and self._hint_live(m)
+            ):
                 fast.setdefault(int(m["u"]), []).append(b)
             else:
                 slow[b] = ranges
@@ -358,7 +421,7 @@ class UnitSlabStore:
             slow.update(self._read_hinted(requests, metas, fast, scratch, deadline))
         if slow:
             self.stats["slow_reads"] += len(slow)
-            self._read_pinned(slow, deadline)
+            self._read_pinned(slow, deadline, metas)
 
     def _failed(self, unit_id: int, blobs: list[str], e: Exception) -> Exception:
         """Classify a failed read: lost if the unit is dead, else retryable."""
@@ -441,10 +504,30 @@ class UnitSlabStore:
         return retry
 
     def _read_pinned(
-        self, requests: dict[str, list[ReadRange]], deadline: float | None = None
+        self,
+        requests: dict[str, list[ReadRange]],
+        deadline: float | None = None,
+        metas: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        """Directory lookup + ``unit.resolve`` pin: blobs without a usable hint."""
-        where = self._where(list(requests))
+        """Locate + ``unit.resolve`` pin: blobs without a usable hint.
+
+        Blobs a unit reports ``pending`` (being demoted or staged back from
+        disk) are asked for again on the Busy backoff until the deadline.
+        """
+        backoff = BUSY_RETRY_S
+        while requests:
+            requests = self._read_pinned_once(requests, deadline, metas or {})
+            if requests:
+                backoff = busy_wait(deadline, backoff)
+
+    def _read_pinned_once(
+        self,
+        requests: dict[str, list[ReadRange]],
+        deadline: float | None,
+        metas: dict[str, dict[str, Any]],
+    ) -> dict[str, list[ReadRange]]:
+        """One resolve + READ round; returns the requests still pending."""
+        where = self._locate(list(requests), metas)
         if len(where) < len(requests):
             raise LostBlobs(
                 [b for b in requests if b not in where], "blob location unknown"
@@ -474,7 +557,11 @@ class UnitSlabStore:
             missing = [b for r in resolved.values() for b in r["missing"]]
             if missing:
                 raise LostBlobs(missing, "blob not on unit")
+            pending = {b for r in resolved.values() for b in r.get("pending", ())}
             for u, blobs in by_unit.items():
+                blobs = [b for b in blobs if b not in pending]
+                if not blobs:
+                    continue
                 uinfo, r = self._unit(u), resolved[u]
                 loc: list[tuple[int, int]] = []
                 rem: list[tuple[int, int]] = []
@@ -496,6 +583,7 @@ class UnitSlabStore:
         finally:
             for u, r in resolved.items():
                 self.ctl.notify(self._units[u]["zmq"], "unpin", pin_id=r["pin_id"])
+        return {b: requests[b] for b in pending}
 
     def release(
         self, counts: dict[str, int], hints: dict[str, dict[str, Any]] | None = None
@@ -506,20 +594,7 @@ class UnitSlabStore:
         current unit instance) needs no lookup; anything else (restored blobs)
         asks the directory, which the restore keeps current.
         """
-        metas = hints or {}
-        loc: dict[str, int] = {}
-        unknown = []
-        for b in counts:
-            m = metas.get(b) or {}
-            if self._hint_live(m):
-                loc[b] = int(m["u"])
-            elif b in self._blob_unit:
-                loc[b] = self._blob_unit[b]
-            else:
-                unknown.append(b)
-        if unknown:
-            loc.update(self._where(unknown))
-        hints = loc
+        hints = self._locate(list(counts), hints or {})
         by_unit: dict[int, list[tuple[str, int]]] = {}
         for b, n in counts.items():
             u = hints.get(b, self._blob_unit.get(b))
