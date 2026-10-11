@@ -65,6 +65,8 @@ __all__ = [
 # Client backoff while units answer Busy (design §5.3): doubling, capped.
 BUSY_RETRY_S = 0.2
 BUSY_RETRY_MAX_S = 2.0
+# First re-ask for blobs a unit reports ``pending`` (staging from disk takes ms).
+PENDING_POLL_S = 0.01
 
 
 class TransferFailed(Exception):
@@ -512,13 +514,18 @@ class UnitSlabStore:
         """Locate + ``unit.resolve`` pin: blobs without a usable hint.
 
         Blobs a unit reports ``pending`` (being demoted or staged back from
-        disk) are asked for again on the Busy backoff until the deadline.
+        disk) are asked for again until the deadline: at once after a round
+        that read something (its unpin frees staging room for the rest), else
+        on a doubling backoff from ``PENDING_POLL_S``.
         """
-        backoff = BUSY_RETRY_S
+        backoff = PENDING_POLL_S
         while requests:
-            requests = self._read_pinned_once(requests, deadline, metas or {})
-            if requests:
+            rest = self._read_pinned_once(requests, deadline, metas or {})
+            if len(rest) < len(requests):
+                backoff = PENDING_POLL_S
+            elif rest:
                 backoff = busy_wait(deadline, backoff)
+            requests = rest
 
     def _read_pinned_once(
         self,

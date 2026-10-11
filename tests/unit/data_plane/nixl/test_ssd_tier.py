@@ -276,8 +276,7 @@ def test_deadline_during_commit_aborts_the_blob():
     assert ("abort", {"blob_id": "b", "in_flight": False}) in ctl.notified
 
 
-def test_pending_blobs_are_asked_again_until_ready(monkeypatch):
-    monkeypatch.setattr(blobstore, "BUSY_RETRY_S", 0.01)
+def test_pending_blobs_are_asked_again_until_ready():
     replies = iter(
         [
             {"pin_id": "p1", "offsets": {}, "missing": [], "pending": ["b"]},
@@ -293,6 +292,32 @@ def test_pending_blobs_are_asked_again_until_ready(monkeypatch):
         "p2",
         "p3",
     ]
+
+
+def test_pending_reads_reask_at_once_after_progress_and_reset_the_backoff(monkeypatch):
+    # A round that read blobs unpins them, freeing staging for the rest, so
+    # the next ask goes out at once; only rounds that read nothing back off.
+    pending = iter([["b", "c"], ["b", "c"], ["b", "c"], ["c"], ["c"], []])
+
+    def resolve(a):
+        p = next(pending)
+        offs = {b: 0 for b in "abc" if b not in p}
+        return {"pin_id": "p", "offsets": offs, "missing": [], "pending": p}
+
+    sleeps = []
+
+    def wait(deadline, backoff):
+        sleeps.append(backoff)
+        return 2 * backoff
+
+    monkeypatch.setattr(blobstore, "busy_wait", wait)
+    ctl = _Ctl({"resolve": resolve})
+    s = _store(ctl)
+    s._blob_unit = {b: 0 for b in "abc"}
+    s._read_pinned({b: [(0, 8, 1000)] for b in "abc"}, deadline=time.monotonic() + 5)
+    assert ctl.calls == ["resolve"] * 6
+    p0 = blobstore.PENDING_POLL_S
+    assert sleeps == [p0, 2 * p0, p0]
 
 
 def test_with_ssd_on_reads_are_pinned_and_find_other_clients_blobs_by_meta():
