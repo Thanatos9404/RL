@@ -53,6 +53,10 @@ class PoolExhausted(RuntimeError):
     """No base buffer is left, or none came free before the caller's timeout."""
 
 
+class PoolTimeout(PoolExhausted):
+    """No base buffer came free before the caller's timeout (retryable)."""
+
+
 def _round_pow2(n: int) -> int:
     return 1 << max(0, (int(n) - 1).bit_length())
 
@@ -121,7 +125,7 @@ class BufferPool:
                         )
                     left = None if deadline is None else deadline - time.monotonic()
                     if left is not None and left <= 0:
-                        raise PoolExhausted(f"no base buffer free within {timeout_s}s")
+                        raise PoolTimeout(f"no base buffer free within {timeout_s}s")
                     self._cv.wait(left)
                 item = self._free_base.pop()
             try:

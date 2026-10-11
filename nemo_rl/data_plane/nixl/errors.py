@@ -55,6 +55,45 @@ class DataPlaneLostKeys(Exception):
         return out
 
 
+# None of the retryable classes below subclasses DataPlaneLostKeys, so an
+# ``except DataPlaneLostKeys`` handler never treats a timeout as data loss.
+class DataPlaneTransferFailed(Exception):
+    """A transfer or a unit reply failed, but the unit still holds the data.
+
+    Retry the operation. ``in_flight`` is True when a NIXL transfer may still
+    be running; its local buffer is retired and the retry gets a fresh one.
+    """
+
+    def __init__(self, keys: list[str], reason: str = "", *, in_flight: bool = False):
+        self.keys = list(keys)
+        self.reason = reason
+        self.in_flight = in_flight
+        super().__init__(
+            f"transfer of {len(self.keys)} key(s) failed"
+            f"{': ' + reason if reason else ''}"
+        )
+
+
+class DataPlaneTimeout(Exception):
+    """An operation ran out of its deadline (``op_timeout_s``). Retryable."""
+
+
+class DataPlaneBusy(Exception):
+    """A unit is temporarily unable to serve; retried inside the operation."""
+
+    def __init__(self, msg: str = "", reason: str | None = None) -> None:
+        super().__init__(msg)
+        self.reason = reason
+
+
+class DataPlaneFatal(RuntimeError):
+    """This process can no longer move data safely. Not retryable.
+
+    Raised once the endpoint is POISONED (unfinished transfers retain more
+    than ``graveyard_max_bytes``) or the client pool has no buffer left.
+    """
+
+
 class TransferError(Exception):
     """A NIXL transfer finished in the ERR state or timed out.
 
@@ -67,6 +106,19 @@ class TransferError(Exception):
     def __init__(self, msg: str = "", *, in_flight: bool = False) -> None:
         super().__init__(msg)
         self.in_flight = in_flight
+
+
+class LostBlobs(Exception):
+    """Some blobs are unreadable for good; the client maps them back to keys.
+
+    Raised only when the bytes are confirmed gone: the unit replied that it
+    no longer has the blob, or the unit itself is dead.
+    """
+
+    def __init__(self, blob_ids: list[str], reason: str) -> None:
+        self.blob_ids = list(blob_ids)
+        self.reason = reason
+        super().__init__(f"{len(self.blob_ids)} blob(s) lost: {reason}")
 
 
 class StaleRead(Exception):

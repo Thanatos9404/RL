@@ -19,6 +19,7 @@ which no real run produces on demand.
 """
 
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -233,7 +234,7 @@ def _plan_with_zero_copy_value():
 def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
     from nemo_rl.data_plane.nixl.errors import UnitFull
 
-    def put_segments(segments, nbytes, n_entries, blob_id):
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
         # The WRITE timed out: every local range it used is now unfinished.
         ep.unfinished.extend((a, n) for a, _, n in segments)
         raise UnitFull("no unit could take it")
@@ -241,7 +242,7 @@ def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
     c, ep = _client_with(put_segments)
     p, zc = _plan_with_zero_copy_value()
     with pytest.raises(UnitFull):
-        c._put_segments(p, "b")
+        c._put_segments(p, "b", time.monotonic() + 60)
     zc_addr = zc.data_ptr()
     assert zc_addr in ep.registered  # never deregistered
     assert [a for a, _, _ in c.retained_sources] == [zc_addr]
@@ -253,12 +254,12 @@ def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
 
 
 def test_zero_copy_source_is_deregistered_after_a_clean_put():
-    def put_segments(segments, nbytes, n_entries, blob_id):
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
         return blob_id, {"u": 0}
 
     c, ep = _client_with(put_segments)
     p, zc = _plan_with_zero_copy_value()
-    c._put_segments(p, "b")
+    c._put_segments(p, "b", time.monotonic() + 60)
     assert zc.data_ptr() not in ep.registered
     assert c.retained_sources == [] and c.pool.retired == []
 
@@ -282,35 +283,40 @@ def _store_with(ep_transfer_error: TransferError):
     st.ctl = SimpleNamespace(
         call=lambda addr, op, **kw: 0,
         notify=lambda addr, op, **kw: notes.append((op, kw)),
+        timeout_ms=30_000,
     )
     st.placement = SimpleNamespace(order=lambda units, **kw: units)
     st.node_id, st.timeout_s = "n0", 0.01
     st._units, st._blob_unit = {0: unit}, {}
     st._refresh_units = lambda: None
+    st._unit_dead = lambda unit_id: False  # a live unit: failures are retryable
     st.stats = {"fast_reads": 0, "slow_reads": 0, "tag_mismatch": 0}
     return st, notes
 
 
 @pytest.mark.parametrize("in_flight", [True, False])
 def test_failed_put_tells_the_unit_whether_the_write_may_still_land(in_flight):
-    from nemo_rl.data_plane.nixl.errors import UnitFull
+    from nemo_rl.data_plane.nixl.blobstore import TransferFailed
 
     st, notes = _store_with(TransferError("timed out", in_flight=in_flight))
-    with pytest.raises(UnitFull):
+    # A failed transfer is retryable, never UnitFull (design §6).
+    with pytest.raises(TransferFailed) as ei:
         st.put_segments([(1000, 0, 64)], 64, 1, blob_id="b")
+    assert ei.value.in_flight is in_flight
     assert notes and all(op == "abort" for op, _ in notes)
     assert all(kw["in_flight"] is in_flight for _, kw in notes)
 
 
 def test_in_flight_hinted_read_fails_instead_of_refilling_the_same_buffer():
-    from nemo_rl.data_plane.nixl.blobstore import LostBlobs
+    from nemo_rl.data_plane.nixl.blobstore import TransferFailed
 
     st, _ = _store_with(TransferError("timed out", in_flight=True))
     pinned = []
-    st._read_pinned = lambda reqs: pinned.append(reqs)
+    st._read_pinned = lambda reqs, deadline=None: pinned.append(reqs)
     meta = {"u": 0, "so": 0, "z": 4096, "g": "abc"}
     scratch = (5000, memoryview(bytearray(64)))
-    with pytest.raises(LostBlobs):
+    # Retryable (the unit is alive), but never refilled into the same buffer.
+    with pytest.raises(TransferFailed):
         st.read({"b": [(0, 64, 1000)]}, {"b": meta}, scratch)
     assert pinned == []  # the late READ could overwrite whatever pinned wrote
 
@@ -318,7 +324,7 @@ def test_in_flight_hinted_read_fails_instead_of_refilling_the_same_buffer():
 def test_failed_hinted_read_that_never_posted_falls_back_to_pinned():
     st, _ = _store_with(TransferError("no peer", in_flight=False))
     pinned = []
-    st._read_pinned = lambda reqs: pinned.append(reqs)
+    st._read_pinned = lambda reqs, deadline=None: pinned.append(reqs)
     meta = {"u": 0, "so": 0, "z": 4096, "g": "abc"}
     st.read({"b": [(0, 64, 1000)]}, {"b": meta}, (5000, memoryview(bytearray(64))))
     assert pinned == [{"b": [(0, 64, 1000)]}]
@@ -396,10 +402,11 @@ def test_file_store_failed_write_keeps_file_and_fd_only_if_in_flight(
     import os
 
     from nemo_rl.data_plane.nixl import blob_format
+    from nemo_rl.data_plane.nixl.blobstore import TransferFailed
 
     st = _file_store(tmp_path, monkeypatch, TransferError("t", in_flight=in_flight))
     p = blob_format.plan(["k"], [b"x" * 64])
-    with pytest.raises(TransferError):
+    with pytest.raises(TransferFailed):
         st.put(1000, p)
     files = os.listdir(tmp_path)
     if in_flight:
@@ -416,13 +423,13 @@ def test_file_store_failed_read_keeps_fd_and_file_through_release(
 ):
     import os
 
-    from nemo_rl.data_plane.nixl.blobstore import LostBlobs
+    from nemo_rl.data_plane.nixl.blobstore import TransferFailed
 
     st = _file_store(tmp_path, monkeypatch, None)
     with open(st.path("b"), "wb") as f:
         f.write(b"\0" * 64)
     st.ep.err = TransferError("t", in_flight=True)
-    with pytest.raises(LostBlobs):
+    with pytest.raises(TransferFailed):  # retryable; the file is still there
         st.read({"b": [(0, 64, 1000)]}, {"b": {"z": 64}})
     st.release({"b": 1})
     st.close()

@@ -44,6 +44,7 @@ checkpointing goes through :mod:`nemo_rl.data_plane.adapters.tq_nixl_checkpoint`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 import threading
@@ -62,11 +63,22 @@ from transfer_queue.storage.managers.base import KVStorageManager, StorageManage
 
 from nemo_rl.data_plane.adapters import tq_nixl_checkpoint
 from nemo_rl.data_plane.nixl import blob_format
-from nemo_rl.data_plane.nixl.blobstore import LostBlobs, UnitSlabStore, make_store
-from nemo_rl.data_plane.nixl.bufpool import BufferPool
+from nemo_rl.data_plane.nixl.blobstore import (
+    LostBlobs,
+    TransferFailed,
+    UnitSlabStore,
+    make_store,
+)
+from nemo_rl.data_plane.nixl.bufpool import BufferPool, PoolExhausted, PoolTimeout
 from nemo_rl.data_plane.nixl.directory import BlobDirectory
-from nemo_rl.data_plane.nixl.errors import DataPlaneLostKeys, StaleRead
-from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
+from nemo_rl.data_plane.nixl.errors import (
+    DataPlaneFatal,
+    DataPlaneLostKeys,
+    DataPlaneTimeout,
+    DataPlaneTransferFailed,
+    StaleRead,
+)
+from nemo_rl.data_plane.nixl.nixl_io import GRAVEYARD, NixlEndpoint
 from nemo_rl.data_plane.nixl.placement import make_placement
 from nemo_rl.data_plane.nixl_storage_unit import NixlStorageUnit
 from nemo_rl.distributed import numa_utils
@@ -84,6 +96,32 @@ def _as_dict(cfg: Any) -> dict[str, Any]:
     except Exception:
         pass
     return dict(cfg or {})
+
+
+# Default lease_margin_s: a pinned read's lease is transfer_timeout_s + this
+# margin (design §3.2).
+LEASE_MARGIN_S = 30.0
+
+
+def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
+    """``(transfer_timeout_s, read_pin_s, op_timeout_s)`` from the config.
+
+    A region freed under a hinted read is reused after ``read_pin_s``, so a
+    READ that may run for ``transfer_timeout_s`` needs ``read_pin_s`` to cover
+    it with margin (design §3.3); anything shorter is rejected.
+    """
+    timeout_s = float(cfg.get("transfer_timeout_s", 120.0))
+    margin = float(cfg.get("lease_margin_s", LEASE_MARGIN_S))
+    read_pin_s = float(cfg.get("read_pin_s", timeout_s + margin))
+    if read_pin_s < timeout_s + margin:
+        raise ValueError(
+            f"NixlStore read_pin_s={read_pin_s} must be >= transfer_timeout_s "
+            f"({timeout_s}) + lease_margin_s ({margin}): a hinted READ may run "
+            "for transfer_timeout_s, and its source region must not be reused "
+            "before it ends"
+        )
+    op_timeout_s = float(cfg.get("op_timeout_s", 2 * timeout_s))
+    return timeout_s, read_pin_s, op_timeout_s
 
 
 def _check_finite(tag: str, keys: list[str], values: list[Any]) -> None:
@@ -180,10 +218,12 @@ class NixlKVClient(StorageKVClient):
         self.zero_copy_min = int(cfg.get("zero_copy_min_bytes", 1 << 20))
         self.zero_copy_max = int(cfg.get("zero_copy_max_bytes", 32 << 20))
         self.parallel_copy_min = int(cfg.get("parallel_copy_min_bytes", 16 << 20))
-        self.timeout_s = float(cfg.get("transfer_timeout_s", 120.0))
-        # Must match the units' pin TTL: a READ that completes after its pin
-        # expired may have observed a reused region and is discarded (§8).
-        self.read_pin_s = float(cfg.get("read_pin_s", 60.0))
+        # read_pin_s must match the units' pin TTL: a READ that completes after
+        # its pin expired may have observed a reused region and is discarded.
+        # Every put / get also has one deadline, op_timeout_s, that bounds all
+        # of its waits (pool, ZMQ replies, transfers, Busy retries).
+        self.timeout_s, self.read_pin_s, self.op_timeout_s = check_timeouts(cfg)
+        GRAVEYARD.max_bytes = int(cfg.get("graveyard_max_bytes", GRAVEYARD.max_bytes))
         self._check = (
             bool(cfg.get("debug_check_finite", False))
             or os.environ.get("NVDP_CHECK_FINITE") == "1"
@@ -218,18 +258,55 @@ class NixlKVClient(StorageKVClient):
             return []
         if self._check:
             _check_finite("put", keys, list(values))
-        if isinstance(self.store, UnitSlabStore):
-            blob_id = uuid.uuid4().hex
-            # The blob id rides in the footer tag so RPC-free readers can verify it.
-            p = blob_format.plan(keys, values, tag=bytes.fromhex(blob_id))
-            blob_id, extra = self._put_segments(p, blob_id)
-        else:  # file store: one contiguous blob
-            p = blob_format.plan(keys, values)
-            with self.pool.acquire(p.nbytes) as (base, buf):
-                blob_format.write(p, memoryview(buf)[: p.nbytes])
-                with self._lock:
-                    blob_id, extra = self.store.put(base, p)
+        deadline = time.monotonic() + self.op_timeout_s
+        with self._errors(keys):
+            if isinstance(self.store, UnitSlabStore):
+                blob_id = uuid.uuid4().hex
+                # The blob id rides in the footer tag so RPC-free readers can verify it.
+                p = blob_format.plan(keys, values, tag=bytes.fromhex(blob_id))
+                blob_id, extra = self._put_segments(p, blob_id, deadline)
+            else:  # file store: one contiguous blob
+                p = blob_format.plan(keys, values)
+                with self._acquire(p.nbytes, deadline) as (base, buf):
+                    blob_format.write(p, memoryview(buf)[: p.nbytes])
+                    with self._lock:
+                        blob_id, extra = self.store.put(base, p, deadline)
         return [{"b": blob_id, **e.meta(), **extra} for e in p.entries]
+
+    def _acquire(self, nbytes: int, deadline: float):
+        """A pool buffer, waiting no longer than the operation's deadline."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise DataPlaneTimeout("operation deadline passed before a pool buffer")
+        return self.pool.acquire(nbytes, timeout_s=left)
+
+    @contextlib.contextmanager
+    def _errors(self, keys: list[str], by_blob: dict[str, list[int]] | None = None):
+        """Map store errors to what NeMo-RL sees (design §6).
+
+        ``by_blob`` maps blob -> key indexes, to name exactly the affected keys.
+        """
+
+        def affected(blob_ids: list[str]) -> list[str]:
+            if by_blob is None:
+                return list(keys)
+            hit = [keys[i] for b in blob_ids for i in by_blob.get(b, [])]
+            return hit or list(keys)
+
+        try:
+            yield
+        except LostBlobs as e:
+            raise DataPlaneLostKeys(affected(e.blob_ids), reason=e.reason) from e
+        except TransferFailed as e:
+            raise DataPlaneTransferFailed(
+                affected(e.blob_ids), e.reason, in_flight=e.in_flight
+            ) from e
+        except PoolTimeout as e:
+            raise DataPlaneTimeout(str(e)) from e
+        except PoolExhausted as e:
+            # Every base buffer was retired and none could be replaced: this
+            # client can no longer move data and must not wait.
+            raise DataPlaneFatal(str(e)) from e
 
     @staticmethod
     def _backing_bytes(owner: Any) -> int:
@@ -255,7 +332,7 @@ class NixlKVClient(StorageKVClient):
         )
 
     def _put_segments(
-        self, p: blob_format.BlobPlan, blob_id: str
+        self, p: blob_format.BlobPlan, blob_id: str, deadline: float
     ) -> tuple[str, dict[str, Any]]:
         """Lay out a blob without building it.
 
@@ -282,7 +359,7 @@ class NixlKVClient(StorageKVClient):
 
         regs: list[tuple[int, np.ndarray, Any]] = []
         try:
-            with self.pool.acquire(packed_bytes) as (base, buf):
+            with self._acquire(packed_bytes, deadline) as (base, buf):
                 segments: list[tuple[int, int, int]] = []
                 for e, mv, at in layout:
                     _copy_into(
@@ -298,7 +375,11 @@ class NixlKVClient(StorageKVClient):
                         regs.append((addr, arr, owner))
                         segments.append((addr, e.off, e.len))
                     return self.store.put_segments(
-                        segments, p.nbytes, len(p.entries), blob_id=blob_id
+                        segments,
+                        p.nbytes,
+                        len(p.entries),
+                        blob_id=blob_id,
+                        deadline=deadline,
                     )
         finally:
             if regs:
@@ -324,9 +405,10 @@ class NixlKVClient(StorageKVClient):
             raise DataPlaneLostKeys(
                 bad or list(keys), reason="no location meta for keys"
             )
+        deadline = time.monotonic() + self.op_timeout_s
         for _attempt in range(2):
             t0 = time.monotonic()
-            out = self._get_once(keys, metas)
+            out = self._get_once(keys, metas, deadline)
             if time.monotonic() - t0 <= self.read_pin_s:
                 if self._check:
                     _check_finite("get", keys, out)
@@ -335,7 +417,9 @@ class NixlKVClient(StorageKVClient):
             f"read of {len(keys)} keys outlived its {self.read_pin_s}s pin twice"
         )
 
-    def _get_once(self, keys: list[str], metas: list[dict[str, Any]]) -> list[Any]:
+    def _get_once(
+        self, keys: list[str], metas: list[dict[str, Any]], deadline: float
+    ) -> list[Any]:
         by_blob: dict[str, list[int]] = {}
         for i, m in enumerate(metas):
             by_blob.setdefault(m["b"], []).append(i)
@@ -344,7 +428,10 @@ class NixlKVClient(StorageKVClient):
         # fetches each blob's footer with the data and checks its tag.
         foot_at = blob_format._align_up(total)
         foot_len = len(by_blob) * blob_format.FOOTER_SIZE
-        with self.pool.acquire(foot_at + foot_len) as (lbase, lbuf):
+        with (
+            self._errors(keys, by_blob),
+            self._acquire(foot_at + foot_len, deadline) as (lbase, lbuf),
+        ):
             lview = memoryview(lbuf)
             scratch = (lbase + foot_at, lview[foot_at : foot_at + foot_len])
             cur = 0
@@ -357,16 +444,13 @@ class NixlKVClient(StorageKVClient):
                     local_off[i] = cur
                     rs.append((int(metas[i]["o"]), n, lbase + cur))
                     cur += n
-            try:
-                with self._lock:
-                    self.store.read(
-                        requests,
-                        {b: metas[idxs[0]] for b, idxs in by_blob.items()},
-                        scratch,
-                    )
-            except LostBlobs as e:
-                keys_lost = [keys[i] for b in e.blob_ids for i in by_blob.get(b, [])]
-                raise DataPlaneLostKeys(keys_lost or list(keys), reason=e.reason) from e
+            with self._lock:
+                self.store.read(
+                    requests,
+                    {b: metas[idxs[0]] for b, idxs in by_blob.items()},
+                    scratch,
+                    deadline,
+                )
             return [
                 blob_format.materialize(
                     blob_format.decode_entry(
@@ -477,6 +561,7 @@ def shutdown(conf_or_backend_cfg: Any) -> None:
 @StorageBootstrapProvider.register_provider("NixlStore")
 def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
     cfg = _as_dict(conf.backend.NixlStore)
+    _, read_pin_s, _ = check_timeouts(cfg)  # fail before starting any actor
     namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
     dir_name = cfg.get("directory_name", "BlobDirectory")
     nixl_cfg = _as_dict(cfg.get("nixl") or {})
@@ -515,7 +600,7 @@ def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
             ).remote(
                 i,
                 int(cfg.get("unit_slab_bytes", 1 << 30)),
-                read_pin_s=float(cfg.get("read_pin_s", 60.0)),
+                read_pin_s=read_pin_s,
                 nixl_backend=nixl_cfg.get("backend_name", "UCX"),
                 nixl_init_params=nixl_cfg.get("backend_init_params") or {},
                 require_rdma=bool(nixl_cfg.get("require_rdma", True)),

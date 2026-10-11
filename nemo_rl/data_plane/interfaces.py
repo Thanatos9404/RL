@@ -138,8 +138,16 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     zero_copy_min_bytes: int = 1048576
     zero_copy_max_bytes: int = 33554432
     parallel_copy_min_bytes: int = 16777216
-    read_pin_s: float = 60.0
+    # read_pin_s must be >= transfer_timeout_s + lease_margin_s (checked at
+    # start): a region freed under a hinted READ is reused after read_pin_s.
+    read_pin_s: float = 150.0
     transfer_timeout_s: float = 120.0
+    lease_margin_s: float = 30.0
+    # Deadline of one put / get, bounding all of its waits; default 2x transfer.
+    op_timeout_s: float = 240.0
+    # Unfinished NIXL transfers may retain this much memory before the
+    # process refuses further transfers (DataPlaneFatal).
+    graveyard_max_bytes: int = 4294967296
     placement: dict[str, Any] = Field(default_factory=lambda: {"policy": "local_first"})
     store: dict[str, Any] = Field(default_factory=lambda: {"kind": "unit"})
     nixl: dict[str, Any] = Field(

@@ -32,7 +32,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from nemo_rl.data_plane.nixl.errors import TransferError, TransportPolicyError
+from nemo_rl.data_plane.nixl.errors import (
+    DataPlaneFatal,
+    TransferError,
+    TransportPolicyError,
+)
 from nemo_rl.utils.checkpoint_engines.nixl import (
     NIXL_DEFAULT_BACKEND_NAME,
     _create_nixl_agent,
@@ -91,6 +95,43 @@ def check_rdma_only(env: Mapping[str, str] | None = None) -> str:
     return f"UCX_TLS={tls} UCX_NET_DEVICES={devs}"
 
 
+class Graveyard:
+    """Every NIXL request in this process that failed short of DONE.
+
+    One per process (:data:`GRAVEYARD`), so dropping an endpoint or adapter
+    can't free an entry through garbage collection. An entry holds the
+    request's handle (never released), its descriptor lists, the agent that
+    owns it, and its local ranges; callers keep the memory behind those
+    ranges alive (the pool retires it, the adapter keeps zero-copy sources).
+
+    Past ``max_bytes`` of retained local ranges the process is POISONED:
+    every later transfer raises :class:`DataPlaneFatal` before touching NIXL.
+    """
+
+    def __init__(self, max_bytes: int = 4 << 30) -> None:
+        self.max_bytes = int(max_bytes)
+        self.entries: list[tuple[Any, ...]] = []
+        self.bytes = 0
+        self.poisoned: str | None = None  # why, once POISONED
+
+    def retain(self, agent: Any, h: Any, ldesc: Any, rdesc: Any, local) -> None:
+        self.entries.append((agent, h, ldesc, rdesc, list(local)))
+        self.bytes += sum(int(n) for _, n in local)
+        if self.bytes > self.max_bytes and self.poisoned is None:
+            self.poisoned = (
+                f"{len(self.entries)} unfinished NIXL transfer(s) retain "
+                f"{self.bytes} B, over graveyard_max_bytes={self.max_bytes}"
+            )
+            log.error("data plane POISONED: %s", self.poisoned)
+
+    def check(self) -> None:
+        if self.poisoned is not None:
+            raise DataPlaneFatal(f"data plane is POISONED: {self.poisoned}")
+
+
+GRAVEYARD = Graveyard()
+
+
 def nixl_available() -> bool:
     try:
         import nixl._api  # noqa: F401
@@ -139,7 +180,8 @@ class NixlEndpoint:
         # DONE: a READ may still write them, a WRITE may still read them. Never
         # cleared: no NIXL call proves such a transfer has stopped.
         self.unfinished: list[tuple[int, int]] = []
-        # Their handles and descriptor lists, kept alive and never released.
+        # Their handles and descriptor lists, kept alive and never released;
+        # also held by the process-wide GRAVEYARD, which outlives this object.
         self.unfinished_handles: list[tuple[Any, Any, Any]] = []
 
     def touches_unfinished(self, addr: int, nbytes: int) -> bool:
@@ -224,6 +266,7 @@ class NixlEndpoint:
         """
         if op not in ("WRITE", "READ"):
             raise ValueError(op)
+        GRAVEYARD.check()
         if len(local) != len(remote) or not local:
             raise ValueError("descriptor lists must be non-empty and equal length")
         for (_, a), (_, b) in zip(local, remote):
@@ -235,7 +278,8 @@ class NixlEndpoint:
         )
         # NIXL reports a broken peer by raising (NIXL_ERR_REMOTE_DISCONNECT,
         # NIXL_ERR_BACKEND, ...) from any of these calls. Surface all of them as
-        # TransferError, which the stores map to LostBlobs -> DataPlaneLostKeys.
+        # TransferError. The stores report it as retryable (TransferFailed ->
+        # DataPlaneTransferFailed) unless the unit is confirmed dead.
         try:
             h = self.agent.initialize_xfer(op, ldesc, rdesc, remote_agent)
         except Exception as e:  # noqa: BLE001 - NIXL binding errors have no common base
@@ -267,6 +311,7 @@ class NixlEndpoint:
         except Exception as e:  # noqa: BLE001
             self.unfinished_handles.append((h, ldesc, rdesc))
             self.unfinished.extend(local)
+            GRAVEYARD.retain(self.agent, h, ldesc, rdesc, local)
             if isinstance(e, TransferError):
                 raise
             raise TransferError(

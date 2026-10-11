@@ -21,6 +21,19 @@ start the units and to publish their addresses once (bootstrap).
 Messages are msgpack ``[op, request_id, args]``; replies ``[request_id, ok,
 result_or_error]``. ``notify`` sends ops that need no reply (``release_many``,
 ``unpin``, ``abort``); the unit sends nothing back for those.
+
+An error reply is ``{"kind", "msg", "reason", "blobs"}`` so the client can
+rebuild the exception the unit raised instead of reporting every failure the
+same way:
+
+======== =================================== ==========================
+kind     client exception                    meaning
+======== =================================== ==========================
+UnitFull ``UnitFull``                        try the next unit
+Busy     ``DataPlaneBusy(reason)``           retry this unit later
+Missing  ``LostBlobs(blobs)``                the unit no longer has them
+Protocol ``TransferError``                   any other server exception
+======== =================================== ==========================
 """
 
 from __future__ import annotations
@@ -33,12 +46,45 @@ from typing import Any, Callable
 import msgspec
 import zmq
 
-from nemo_rl.data_plane.nixl.errors import TransferError, UnitFull
+from nemo_rl.data_plane.nixl.errors import (
+    DataPlaneBusy,
+    LostBlobs,
+    TransferError,
+    UnitFull,
+)
 
 _enc = msgspec.msgpack.Encoder()
 _dec = msgspec.msgpack.Decoder()
 
 NO_REPLY = {"release_many", "unpin", "abort"}
+
+
+def error_reply(e: BaseException) -> dict[str, Any]:
+    """The wire form of a server-side exception (see the module docstring)."""
+    out: dict[str, Any] = {"kind": "Protocol", "msg": f"{type(e).__name__}: {e}"}
+    if isinstance(e, UnitFull):
+        out = {"kind": "UnitFull", "msg": str(e)}
+    elif isinstance(e, DataPlaneBusy):
+        out = {"kind": "Busy", "msg": str(e), "reason": e.reason}
+    elif isinstance(e, LostBlobs):
+        out = {"kind": "Missing", "msg": e.reason, "blobs": e.blob_ids}
+    out.setdefault("reason", None)
+    out.setdefault("blobs", None)
+    return out
+
+
+def raise_reply(address: str, op: str, err: Any) -> None:
+    """Rebuild and raise the exception behind an error reply."""
+    if not isinstance(err, dict):  # pre-structured peer: [type_name, msg]
+        err = {"kind": "Protocol", "msg": ": ".join(map(str, err))}
+    kind, msg = err.get("kind"), err.get("msg", "")
+    if kind == "UnitFull":
+        raise UnitFull(msg)
+    if kind == "Busy":
+        raise DataPlaneBusy(f"unit {address} {op}: {msg}", reason=err.get("reason"))
+    if kind == "Missing":
+        raise LostBlobs(list(err.get("blobs") or []), msg or "blob not on unit")
+    raise TransferError(f"unit {address} {op}: {msg}")
 
 
 def node_ip() -> str:
@@ -104,10 +150,8 @@ class UnitServer:
                     raise ValueError(f"unknown op {op!r}")
                 with self.lock:
                     result, ok = fn(**args), True
-            except UnitFull as e:
-                result, ok = ["UnitFull", str(e)], False
             except Exception as e:  # noqa: BLE001 - reported to the caller
-                result, ok = [type(e).__name__, str(e)], False
+                result, ok = error_reply(e), False
             if op not in NO_REPLY:
                 try:
                     self.sock.send_multipart([ident, _enc.encode([rid, ok, result])])
@@ -146,29 +190,33 @@ class UnitClient:
         if s is not None:
             s.close(0)
 
-    def call(self, address: str, op: str, **args: Any) -> Any:
+    def call(
+        self, address: str, op: str, *, timeout_s: float | None = None, **args: Any
+    ) -> Any:
         """Request/reply.
 
-        Raises ``UnitFull`` as itself and ``TransferError`` for a dead or unreachable unit (timeout) or a server-side error.
+        Raises what the unit raised (see the module docstring), and
+        ``TransferError`` when no reply comes within ``timeout_s`` (default: the
+        client's timeout; callers pass their remaining operation budget).
         """
+        timeout_ms = self.timeout_ms
+        if timeout_s is not None:
+            timeout_ms = max(1, min(timeout_ms, int(timeout_s * 1000)))
         rid = uuid.uuid4().hex[:12]
         s = self._sock(address)
         s.send(_enc.encode([op, rid, args]))
         while True:
-            if not s.poll(self.timeout_ms, zmq.POLLIN):
+            if not s.poll(timeout_ms, zmq.POLLIN):
                 self._drop(address)  # a late reply must not reach the next caller
                 raise TransferError(
-                    f"unit {address} did not answer {op} within {self.timeout_ms / 1000:.0f}s"
+                    f"unit {address} did not answer {op} within {timeout_ms / 1000:.1f}s"
                 )
             got_rid, ok, result = _dec.decode(s.recv())
             if got_rid != rid:
                 continue  # stale reply from an earlier timed-out call
             if ok:
                 return result
-            kind, msg = result
-            if kind == "UnitFull":
-                raise UnitFull(msg)
-            raise TransferError(f"unit {address} {op}: {kind}: {msg}")
+            raise_reply(address, op, result)
 
     def notify(self, address: str, op: str, **args: Any) -> None:
         """Fire-and-forget (no reply is sent for ``NO_REPLY`` ops)."""

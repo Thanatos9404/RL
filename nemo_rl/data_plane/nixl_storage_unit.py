@@ -23,8 +23,9 @@ the store-side pieces it uses live in :mod:`nemo_rl.data_plane.nixl`.
 
 from __future__ import annotations
 
-import os
 import functools
+import logging
+import os
 import threading
 import time
 import uuid
@@ -41,6 +42,8 @@ from nemo_rl.data_plane.nixl.errors import UnitFull
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
 from nemo_rl.distributed import numa_utils
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class BlobRec:
@@ -50,6 +53,7 @@ class BlobRec:
     created_at: float
     last_resolve_at: float = 0.0
     pins: dict[str, float] = field(default_factory=dict)  # pin_id → expiry (monotonic)
+    holds: int = 0  # checkpoints copying this blob right now (save_shard)
 
     def pin_expiry(self, now: float) -> float:
         live = [t for t in self.pins.values() if t > now]
@@ -84,7 +88,7 @@ class NixlStorageUnit:
         unit_id: int,
         slab_bytes: int,
         *,
-        read_pin_s: float = 60.0,
+        read_pin_s: float = 150.0,
         nixl_backend: str = "UCX",
         nixl_init_params: dict[str, Any] | None = None,
         directory: Any = None,
@@ -124,6 +128,11 @@ class NixlStorageUnit:
         self.blobs: dict[str, BlobRec] = {}
         self._pins: dict[str, list[str]] = {}  # pin_id → blob_ids
         self.retired_bytes = 0  # regions of WRITEs that never reached DONE
+        # Blobs released while a checkpoint still copies them: freed once the
+        # save's holds drop (save_shard's finally).
+        self._released_held: dict[str, BlobRec] = {}
+        self.checkpointing = False
+        self.clears_during_save = 0
         self._directory = directory  # admin/restore only; never on the op path
         self.node_id = ray.get_runtime_context().get_node_id()
         self._mu = threading.RLock()
@@ -201,18 +210,27 @@ class NixlStorageUnit:
         rec.refs -= int(n_entries)
         if rec.refs > 0:
             return rec.refs
+        self.blobs.pop(blob_id, None)
+        if self.checkpointing:
+            self.clears_during_save += 1  # TQ says no clears during a save
+        if rec.holds:
+            # A checkpoint is still copying it: free it when the save is done.
+            self._released_held[blob_id] = rec
+        else:
+            self._free_region(rec)
+        return 0
+
+    def _free_region(self, rec: BlobRec) -> None:
         now = time.monotonic()
         # Always quarantine for read_pin_s, pinned or not: clients read with
         # cached (unit, offset) hints and no pin RPC, so a freed region must not
         # be reused while such a read could still be in flight. The blob tag in
         # the footer catches anything older than that.
         release_at = max(rec.pin_expiry(now), now + self.read_pin_s)
-        self.blobs.pop(blob_id, None)
         if release_at <= now:
             self.alloc_.free(rec.off, rec.nbytes)
         else:
             self.alloc_.quarantine(rec.off, rec.nbytes, release_at)
-        return 0
 
     @_locked
     def release_many(self, items: list[tuple[str, int]]) -> None:
@@ -301,26 +319,57 @@ class NixlStorageUnit:
         return bytes(self.slab[off : off + nbytes])
 
     # ------------------------------------------------------------------ checkpoint (A2)
-    @_locked
     def save_shard(self, path: str) -> dict[str, Any]:
         """Dump every live blob back to back into ``path``.
 
-        Returns ``{"blobs": {blob_id: [off_in_file, nbytes, refs]}, "nbytes": total}``.
-        Caller is quiescent (TQ checkpoint barrier): no put is mid-WRITE.
-        """
-        index: dict[str, list[int]] = {}
-        tmp = path + ".tmp"
-        pos = 0
-        view = memoryview(self.slab)
-        with open(tmp, "wb") as f:
-            for b, rec in self.blobs.items():
-                f.write(view[rec.off : rec.off + rec.nbytes])
-                index[b] = [pos, rec.nbytes, rec.refs]
-                pos += rec.nbytes
-        os.replace(tmp, path)
-        return {"blobs": index, "nbytes": pos}
+        Returns ``{"blobs": {blob_id: [off_in_file, nbytes, refs]}, "nbytes":
+        total, "clears_during_save": n}``.
 
-    @_locked
+        The snapshot is taken under the unit lock; the file I/O runs without it
+        (blocking syscalls, design §2.5), so puts, reads and clears keep being
+        served. Each snapshotted blob carries a hold: one released meanwhile is
+        freed only after it is copied. Every exit, including an exception at
+        any step, drops exactly the holds taken (one outer try).
+        """
+        held: list[tuple[str, BlobRec, int]] = []
+        try:
+            with self._mu:
+                self.checkpointing = True
+                self.clears_during_save = 0
+                for b, rec in self.blobs.items():
+                    rec.holds += 1
+                    held.append((b, rec, rec.refs))
+            index: dict[str, list[int]] = {}
+            tmp = path + ".tmp"
+            pos = 0
+            view = memoryview(self.slab)
+            with open(tmp, "wb") as f:
+                for b, rec, refs in held:
+                    f.write(view[rec.off : rec.off + rec.nbytes])
+                    index[b] = [pos, rec.nbytes, refs]
+                    pos += rec.nbytes
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            with self._mu:
+                for _, rec, _ in held:
+                    rec.holds -= 1
+                for b, rec in list(self._released_held.items()):
+                    if rec.holds == 0:
+                        del self._released_held[b]
+                        self._free_region(rec)
+                self.checkpointing = False
+                clears = self.clears_during_save
+        if clears:
+            log.warning(
+                "unit %d: %d blob(s) released during save_shard; TransferQueue "
+                "does not support clears during a checkpoint",
+                self.unit_id,
+                clears,
+            )
+        return {"blobs": index, "nbytes": pos, "clears_during_save": clears}
+
     def load_shard(
         self, path: str, blobs: dict[str, list[int]]
     ) -> dict[str, list[str]]:
@@ -328,33 +377,45 @@ class NixlStorageUnit:
 
         Blobs that do not fit are returned under ``failed`` so the caller can
         spill them to another unit; already-present blobs count as loaded.
+
+        Regions are allocated under the unit lock but filled without it; a
+        blob is published only once its bytes are in place.
         """
         loaded: list[str] = []
         failed: list[str] = []
-        now = time.monotonic()
-        self.alloc_.reclaim(now)
         view = memoryview(self.slab)
         with open(path, "rb", buffering=0) as f:
             for b, (off, nbytes, refs) in blobs.items():
-                if b in self.blobs:
-                    loaded.append(b)
-                    continue
+                nbytes = int(nbytes)
+                with self._mu:
+                    if b in self.blobs:
+                        loaded.append(b)
+                        continue
+                    self.alloc_.reclaim(time.monotonic())
+                    try:
+                        dst = self.alloc_.alloc(nbytes)
+                    except UnitFull:
+                        failed.append(b)
+                        continue
                 try:
-                    dst = self.alloc_.alloc(int(nbytes))
-                except UnitFull:
-                    failed.append(b)
-                    continue
-                f.seek(int(off))
-                target = view[dst : dst + int(nbytes)]
-                done = 0
-                while done < int(nbytes):
-                    n = f.readinto(target[done:])
-                    if not n:
-                        self.alloc_.free(dst, int(nbytes))
-                        raise IOError(f"short read restoring blob {b} from {path}")
-                    done += n
-                self.blobs[b] = BlobRec(
-                    off=dst, nbytes=int(nbytes), refs=int(refs), created_at=now
-                )
+                    f.seek(int(off))
+                    target = view[dst : dst + nbytes]
+                    done = 0
+                    while done < nbytes:
+                        n = f.readinto(target[done:])
+                        if not n:
+                            raise IOError(f"short read restoring blob {b} from {path}")
+                        done += n
+                except BaseException:
+                    with self._mu:
+                        self.alloc_.free(dst, nbytes)
+                    raise
+                with self._mu:
+                    self.blobs[b] = BlobRec(
+                        off=dst,
+                        nbytes=nbytes,
+                        refs=int(refs),
+                        created_at=time.monotonic(),
+                    )
                 loaded.append(b)
         return {"loaded": loaded, "failed": failed}

@@ -111,6 +111,7 @@ def _save_units(store: UnitSlabStore, root: Path) -> dict[str, Any]:
                 "file": f"unit-{u}.shard",
                 "nbytes": r["nbytes"],
                 "blobs": r["blobs"],
+                "clears_during_save": int(r.get("clears_during_save", 0)),
             }
         )
     return {"version": VERSION, "store": "unit", "shards": shards}

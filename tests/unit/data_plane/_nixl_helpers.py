@@ -21,7 +21,7 @@ def make_tq_conf(
     num_units: int = 2,
     slab_bytes: int = 64 << 20,
     staging_bytes: int = 32 << 20,
-    read_pin_s: float = 2.0,
+    read_pin_s: float = 4.0,
     namespace: str = "nrl-nixl-test-ns",
 ):
     from omegaconf import OmegaConf
@@ -38,6 +38,9 @@ def make_tq_conf(
                     "unit_slab_bytes": slab_bytes,
                     "client_staging_bytes": staging_bytes,
                     "read_pin_s": read_pin_s,
+                    # read_pin_s >= transfer_timeout_s + lease_margin_s
+                    "transfer_timeout_s": read_pin_s - 1.0,
+                    "lease_margin_s": 1.0,
                     "nixl": {"backend_name": "UCX", "backend_init_params": {}},
                 },
             },

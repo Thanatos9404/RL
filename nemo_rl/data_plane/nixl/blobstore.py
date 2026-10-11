@@ -33,6 +33,7 @@ and rewriting its meta (that is what tiering and checkpoint shards are).
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from collections import OrderedDict
 from typing import Any, Protocol
@@ -41,19 +42,52 @@ import ray
 
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.control import UnitClient
-from nemo_rl.data_plane.nixl.directory import LOST
-from nemo_rl.data_plane.nixl.errors import TransferError, UnitFull
+from nemo_rl.data_plane.nixl.directory import DEAD, LOST
+from nemo_rl.data_plane.nixl.errors import (
+    DataPlaneBusy,
+    DataPlaneTimeout,
+    LostBlobs,
+    TransferError,
+    UnitFull,
+)
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
 from nemo_rl.data_plane.nixl.placement import Placement
 
+__all__ = [
+    "BlobStore",
+    "FileStore",
+    "LostBlobs",
+    "TransferFailed",
+    "UnitSlabStore",
+    "make_store",
+]
 
-class LostBlobs(Exception):
-    """Some blobs are unreadable; the client maps them back to keys."""
+# Client backoff while units answer Busy (design §5.3): doubling, capped.
+BUSY_RETRY_S = 0.2
+BUSY_RETRY_MAX_S = 2.0
 
-    def __init__(self, blob_ids: list[str], reason: str) -> None:
+
+class TransferFailed(Exception):
+    """A transfer or a control call failed, but the unit still has the blobs.
+
+    The caller may retry. ``in_flight``: a NIXL transfer may still be running.
+    """
+
+    def __init__(self, blob_ids: list[str], reason: str, *, in_flight: bool = False):
         self.blob_ids = list(blob_ids)
         self.reason = reason
-        super().__init__(f"{len(self.blob_ids)} blob(s) lost: {reason}")
+        self.in_flight = in_flight
+        super().__init__(f"{len(self.blob_ids)} blob(s): {reason}")
+
+
+def remaining(deadline: float | None, cap: float) -> float:
+    """``min(cap, deadline - now)``; raise :class:`DataPlaneTimeout` if spent."""
+    if deadline is None:
+        return cap
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise DataPlaneTimeout("operation deadline passed")
+    return min(cap, left)
 
 
 # (off_in_blob, nbytes, local_addr)
@@ -62,7 +96,10 @@ ReadRange = tuple[int, int, int]
 
 class BlobStore(Protocol):
     def put(
-        self, local_addr: int, p: blob_format.BlobPlan
+        self,
+        local_addr: int,
+        p: blob_format.BlobPlan,
+        deadline: float | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Store the blob at ``local_addr``; return ``(blob_id, extra_meta)``."""
         ...
@@ -72,8 +109,13 @@ class BlobStore(Protocol):
         requests: dict[str, list[ReadRange]],
         metas: dict[str, dict[str, Any]],
         scratch: tuple[int, memoryview] | None = None,
+        deadline: float | None = None,
     ) -> None:
-        """Fill every local range from its blob. Raises :class:`LostBlobs`."""
+        """Fill every local range from its blob.
+
+        Raises :class:`LostBlobs` for confirmed loss, :class:`TransferFailed`
+        for a retryable failure, :class:`DataPlaneTimeout` past ``deadline``.
+        """
         ...
 
     def release(
@@ -190,9 +232,14 @@ class UnitSlabStore:
 
     # -- BlobStore
     def put(
-        self, local_addr: int, p: blob_format.BlobPlan
+        self,
+        local_addr: int,
+        p: blob_format.BlobPlan,
+        deadline: float | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        return self.put_segments([(local_addr, 0, p.nbytes)], p.nbytes, len(p.entries))
+        return self.put_segments(
+            [(local_addr, 0, p.nbytes)], p.nbytes, len(p.entries), deadline=deadline
+        )
 
     def put_segments(
         self,
@@ -200,6 +247,7 @@ class UnitSlabStore:
         nbytes: int,
         n_entries: int,
         blob_id: str | None = None,
+        deadline: float | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Write one blob of ``nbytes`` from scattered registered regions.
 
@@ -207,12 +255,20 @@ class UnitSlabStore:
         from the caller's own (registered) memory, or a run copied into a pool
         buffer. All go out in one NIXL transfer. Returns ``(blob_id, hint)``;
         the hint ``{"u", "so", "z"}`` lets readers skip every RPC.
+
+        Every wait is bounded by ``deadline`` (monotonic). Raises
+        :class:`UnitFull` only when every unit refused for lack of space,
+        :class:`TransferFailed` when units failed otherwise, and
+        :class:`DataPlaneTimeout` when the deadline passes (also while units
+        keep answering Busy, design §5.3).
         """
         blob_id = blob_id or uuid.uuid4().hex
         if not self._units:
             self._refresh_units()
-        last_err: Exception | None = None
-        for attempt in range(2):
+        backoff = BUSY_RETRY_S
+        refreshed = False
+        while True:
+            errs: list[Exception] = []
             for cand in self.placement.order(
                 list(self._units.values()), node_id=self.node_id, nbytes=nbytes
             ):
@@ -221,28 +277,35 @@ class UnitSlabStore:
                     off = self.ctl.call(
                         self._addr(unit_id),
                         "alloc",
+                        timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
                         blob_id=blob_id,
                         nbytes=int(nbytes),
                         n_entries=int(n_entries),
                     )
-                except (UnitFull, TransferError, LostBlobs) as e:
-                    last_err = e
+                except (UnitFull, DataPlaneBusy, TransferError, LostBlobs) as e:
+                    errs.append(e)
                     continue
                 u = self._unit(unit_id)
                 base = int(u["slab_base"]) + off
+                try:
+                    left = remaining(deadline, self.timeout_s)
+                except DataPlaneTimeout:
+                    # Nothing was posted: the unit can free the region at once.
+                    self.ctl.notify(u["zmq"], "abort", blob_id=blob_id, in_flight=False)
+                    raise
                 try:
                     self.ep.transfer(
                         "WRITE",
                         [(a, n) for a, _, n in segments],
                         [(base + bo, n) for _, bo, n in segments],
                         u["agent_name"],
-                        timeout_s=self.timeout_s,
+                        timeout_s=left,
                     )
                 except TransferError as e:
                     self.ctl.notify(
                         u["zmq"], "abort", blob_id=blob_id, in_flight=e.in_flight
                     )
-                    last_err = e
+                    errs.append(e)
                     continue
                 self._blob_unit[blob_id] = unit_id
                 return blob_id, {
@@ -251,20 +314,37 @@ class UnitSlabStore:
                     "z": int(nbytes),
                     "g": self._gen(unit_id),
                 }
-            if attempt == 0:
+            if any(isinstance(e, DataPlaneBusy) for e in errs):
+                time.sleep(remaining(deadline, backoff))
+                backoff = min(2 * backoff, BUSY_RETRY_MAX_S)
+                continue
+            if not refreshed:
                 self._refresh_units()  # membership may have changed; one retry
-        raise UnitFull(f"no unit could take {nbytes} B: {last_err}")
+                refreshed = True
+                continue
+            if errs and all(isinstance(e, UnitFull) for e in errs):
+                raise UnitFull(f"no unit could take {nbytes} B: {errs[-1]}")
+            raise TransferFailed(
+                [blob_id],
+                f"no unit took {nbytes} B: {errs[-1] if errs else 'no units'}",
+                in_flight=any(getattr(e, "in_flight", False) for e in errs),
+            )
 
     def read(
         self,
         requests: dict[str, list[ReadRange]],
         metas: dict[str, dict[str, Any]],
         scratch: tuple[int, memoryview] | None = None,
+        deadline: float | None = None,
     ) -> None:
         """Fill every local range from its blob.
 
         ``scratch`` gives registered room for one footer per blob
         (``len(requests) * FOOTER_SIZE`` bytes) and enables the RPC-free path for blobs whose meta carries a hint.
+
+        Raises :class:`LostBlobs` only for confirmed loss (the unit lacks the
+        blob, or the unit is dead) and :class:`TransferFailed` when a transfer
+        or reply failed while the unit is still alive.
         """
         slow: dict[str, list[ReadRange]] = {}
         fast: dict[int, list[str]] = {}
@@ -275,13 +355,42 @@ class UnitSlabStore:
             else:
                 slow[b] = ranges
         if fast:
-            slow.update(self._read_hinted(requests, metas, fast, scratch))
+            slow.update(self._read_hinted(requests, metas, fast, scratch, deadline))
         if slow:
             self.stats["slow_reads"] += len(slow)
-            self._read_pinned(slow)
+            self._read_pinned(slow, deadline)
+
+    def _failed(self, unit_id: int, blobs: list[str], e: Exception) -> Exception:
+        """Classify a failed read: lost if the unit is dead, else retryable."""
+        if self._unit_dead(unit_id):
+            return LostBlobs(blobs, f"unit {unit_id} is dead: {e}")
+        return TransferFailed(blobs, str(e), in_flight=getattr(e, "in_flight", False))
+
+    def _unit_dead(self, unit_id: int) -> bool:
+        """Ask Ray whether a unit's actor is gone; mark it DEAD if so.
+
+        Only runs after a failure, so the op path stays Ray-free. A unit that
+        is alive but slow is not dead: its blobs are still there.
+        """
+        try:
+            actor = ray.get_actor(
+                f"NixlStorageUnit#{unit_id}", namespace=self.namespace
+            )
+            ray.get(actor.ping.remote(), timeout=10)
+            return False
+        except ray.exceptions.GetTimeoutError:
+            return False
+        except Exception:  # noqa: BLE001 - name gone or RayActorError: the actor died
+            pass
+        try:
+            ray.get(self.directory.set_unit_state.remote(unit_id, DEAD))
+            self._refresh_units()
+        except Exception:  # noqa: BLE001 - the verdict stands without the directory
+            pass
+        return True
 
     def _read_hinted(
-        self, requests, metas, fast, scratch
+        self, requests, metas, fast, scratch, deadline=None
     ) -> dict[str, list[ReadRange]]:
         sbase, sview = scratch
         fsz = blob_format.FOOTER_SIZE
@@ -308,13 +417,17 @@ class UnitSlabStore:
                 slot += 1
             try:
                 self.ep.transfer(
-                    "READ", loc, rem, uinfo["agent_name"], timeout_s=self.timeout_s
+                    "READ",
+                    loc,
+                    rem,
+                    uinfo["agent_name"],
+                    timeout_s=remaining(deadline, self.timeout_s),
                 )
             except TransferError as e:
                 if e.in_flight:
                     # The READ may still land in these local ranges, so they
                     # cannot be refilled by the pinned path; fail the read.
-                    raise LostBlobs(blobs, str(e)) from e
+                    raise self._failed(unit_id, blobs, e) from e
                 retry.update({b: requests[b] for b in blobs})
                 continue
             for b in blobs:
@@ -327,7 +440,9 @@ class UnitSlabStore:
                     retry[b] = requests[b]
         return retry
 
-    def _read_pinned(self, requests: dict[str, list[ReadRange]]) -> None:
+    def _read_pinned(
+        self, requests: dict[str, list[ReadRange]], deadline: float | None = None
+    ) -> None:
         """Directory lookup + ``unit.resolve`` pin: blobs without a usable hint."""
         where = self._where(list(requests))
         if len(where) < len(requests):
@@ -341,13 +456,20 @@ class UnitSlabStore:
         resolved: dict[int, dict[str, Any]] = {}
         for u, bs in by_unit.items():
             try:
-                resolved[u] = self.ctl.call(self._addr(u), "resolve", blob_ids=bs)
-            except (TransferError, LostBlobs) as e:
+                resolved[u] = self.ctl.call(
+                    self._addr(u),
+                    "resolve",
+                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
+                    blob_ids=bs,
+                )
+            except (TransferError, LostBlobs, DataPlaneTimeout) as e:
                 for done_u, r in resolved.items():
                     self.ctl.notify(
                         self._units[done_u]["zmq"], "unpin", pin_id=r["pin_id"]
                     )
-                raise LostBlobs(bs, f"unit {u} is unreachable: {e}")
+                if isinstance(e, DataPlaneTimeout):
+                    raise
+                raise self._failed(u, bs, e) from e
         try:
             missing = [b for r in resolved.values() for b in r["missing"]]
             if missing:
@@ -363,10 +485,14 @@ class UnitSlabStore:
                         rem.append((base + off, n))
                 try:
                     self.ep.transfer(
-                        "READ", loc, rem, uinfo["agent_name"], timeout_s=self.timeout_s
+                        "READ",
+                        loc,
+                        rem,
+                        uinfo["agent_name"],
+                        timeout_s=remaining(deadline, self.timeout_s),
                     )
                 except TransferError as e:
-                    raise LostBlobs(blobs, str(e))
+                    raise self._failed(u, blobs, e) from e
         finally:
             for u, r in resolved.items():
                 self.ctl.notify(self._units[u]["zmq"], "unpin", pin_id=r["pin_id"])
@@ -489,9 +615,13 @@ class FileStore:
 
     # -- BlobStore
     def put(
-        self, local_addr: int, p: blob_format.BlobPlan
+        self,
+        local_addr: int,
+        p: blob_format.BlobPlan,
+        deadline: float | None = None,
     ) -> tuple[str, dict[str, Any]]:
         blob_id = uuid.uuid4().hex
+        left = remaining(deadline, self.timeout_s)
         fd = self._fd(blob_id, p.nbytes, create=True)
         try:
             self.ep.transfer(
@@ -499,20 +629,20 @@ class FileStore:
                 [(local_addr, p.nbytes)],
                 [(0, p.nbytes)],
                 self.ep.name,
-                timeout_s=self.timeout_s,
+                timeout_s=left,
                 remote_mem="FILE",
                 remote_dev=fd,
             )
         except TransferError as e:
             if e.in_flight:
                 self._retain(blob_id)  # the WRITE may still land in the file
-                raise
-            self._forget(blob_id)
-            try:
-                os.remove(self.path(blob_id))
-            except FileNotFoundError:
-                pass
-            raise
+            else:
+                self._forget(blob_id)
+                try:
+                    os.remove(self.path(blob_id))
+                except FileNotFoundError:
+                    pass
+            raise TransferFailed([blob_id], str(e), in_flight=e.in_flight) from e
         ray.get(self.directory.put_blobs.remote([(blob_id, -1, len(p.entries))]))
         return blob_id, {
             "z": p.nbytes
@@ -523,7 +653,9 @@ class FileStore:
         requests: dict[str, list[ReadRange]],
         metas: dict[str, dict[str, Any]],
         scratch: tuple[int, memoryview] | None = None,
+        deadline: float | None = None,
     ) -> None:
+        """A missing file is :class:`LostBlobs`; a failed READ is retryable."""
         for b, ranges in requests.items():
             nbytes = int(metas[b]["z"])
             fd = self._fd(b, nbytes, create=False)
@@ -535,14 +667,14 @@ class FileStore:
                     loc,
                     rem,
                     self.ep.name,
-                    timeout_s=self.timeout_s,
+                    timeout_s=remaining(deadline, self.timeout_s),
                     remote_mem="FILE",
                     remote_dev=fd,
                 )
             except TransferError as e:
                 if e.in_flight:
                     self._retain(b)  # the READ may still use the fd
-                raise LostBlobs([b], str(e))
+                raise TransferFailed([b], str(e), in_flight=e.in_flight) from e
 
     def release(
         self, counts: dict[str, int], hints: dict[str, int] | None = None
