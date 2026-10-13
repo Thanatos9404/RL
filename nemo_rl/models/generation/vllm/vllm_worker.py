@@ -78,6 +78,7 @@ from nemo_rl.telemetry.setup import (
     vllm_native_tracing_requested,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -85,6 +86,19 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _actor_waits_for_compile_cache(
+    executor_backend: str | None, *, ray_v2_executor: bool
+) -> bool:
+    """Whether the vLLM actor must wait for the policy compile cache itself.
+
+    RayExecutorV2 GPU workers wait for this node's copy themselves
+    (worker_init_hook.py). Any other engine compiles in the actor's own process,
+    or in Ray workers that run no NeMo RL hook, so the actor waits before it
+    creates the engine.
+    """
+    return executor_backend != "ray" or not ray_v2_executor
 
 
 def _context_capped_max_new_tokens(
@@ -330,10 +344,34 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = (
-                os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
-                + f"_{seed}"
+            # NRL_VLLM_CACHE_ROOT_PER_ENGINE=0 keeps VLLM_CACHE_ROOT unsuffixed so
+            # a persistent (seeded) cache path is reused across jobs. Only safe
+            # when no two engines on a node share the path, e.g. a node-local
+            # root with one engine per node.
+            vllm_cache_root = os.environ.get(
+                "VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")
             )
+            if os.environ.get("NRL_VLLM_CACHE_ROOT_PER_ENGINE", "1") != "0":
+                vllm_cache_root += f"_{seed}"
+            env_vars["VLLM_CACHE_ROOT"] = vllm_cache_root
+
+            # Generation-only JIT cache directories (NRL_VLLM_<VAR>), separate
+            # from the trainer's, and the cache type the engine's Ray GPU
+            # workers wait for (worker_init_hook.py); see
+            # nemo_rl/utils/compile_cache.py.
+            jit_cache_env = compile_cache.env_overrides("VLLM")
+            if compile_cache.enabled():
+                jit_cache_env[compile_cache.VLLM_CACHE_TYPE_ENV_VAR] = (
+                    compile_cache.POLICY_CACHE_TYPE
+                )
+            if jit_cache_env:
+                env_vars.update(jit_cache_env)
+                # vLLM's v1 Ray executor copies only listed variables to its
+                # workers (RayExecutorV2 copies the driver's environment).
+                extra = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
+                env_vars["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(
+                    [var for var in extra.split(",") if var] + list(jit_cache_env)
+                )
 
             # Give each vLLM engine a deterministic starting VLLM_PORT for the
             # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
@@ -435,6 +473,12 @@ class BaseVllmGenerationWorker:
         """
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
+        # Start copying the policy's persistent compile cache onto this node in
+        # the background (no-op unless configured). The engine waits for it
+        # right before it compiles (see _load_model), so the copy overlaps the
+        # rest of setup instead of running on the driver's serial path.
+        compile_cache.seed(compile_cache.POLICY_CACHE_TYPE, background=True)
+
         # Only bind single-GPU workers to their GPU's NUMA node.
         # For TP>1 workers, the parent process spans multiple NUMA nodes;
         # binding it would incorrectly constrain the EngineCore subprocess
@@ -532,6 +576,7 @@ class BaseVllmGenerationWorker:
         Split out from __init__ so it can be deferred (defer_model_load=True)
         and run after ports are reserved, overlapping with NeMo Gym init.
         """
+        from vllm import envs as vllm_envs
         from vllm.logger import init_logger
 
         logger = init_logger("vllm_load_model")
@@ -608,6 +653,15 @@ class BaseVllmGenerationWorker:
             self.expert_parallel_size,
         )
         vllm_kwargs["distributed_executor_backend"] = executor_backend
+
+        # Wait for this node's copy of the policy compile cache (started in
+        # __init__) before the engine compiles, unless its RayExecutorV2 workers
+        # wait for it themselves, which overlaps the copy with engine startup.
+        if _actor_waits_for_compile_cache(
+            executor_backend,
+            ray_v2_executor=vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND,
+        ):
+            compile_cache.seed(compile_cache.POLICY_CACHE_TYPE)
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"

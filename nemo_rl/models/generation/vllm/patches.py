@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
 
 VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+# Persistent per-type compile caches are on when the launcher sets this (the
+# path to cache_sync.sh); see nemo_rl/utils/compile_cache.py, which cannot be
+# imported here.
+COMPILE_CACHE_SYNC_ENV_VAR = "NRL_CACHE_SYNC"
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -520,6 +524,67 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
             "spanning nodes may fail with EADDRINUSE at startup.",
             file_to_patch,
         )
+
+
+def _patch_vllm_ray_worker_proc_init_hook(logger) -> None:
+    """Run NeMo RL's worker init hook in every RayExecutorV2 worker process.
+
+    Inserts a call to ``worker_init_hook.on_ray_worker_init()`` in
+    ``RayWorkerProc.initialize_worker``, after the driver's environment has been
+    applied and before the worker is constructed, i.e. before it loads or
+    compiles anything. The hook waits for this node's copy of the policy's
+    persistent compile cache, which the NeMo RL vLLM actor starts in the
+    background (``nemo_rl/utils/compile_cache.py``), so the copy stays off the
+    driver's serial worker-creation path.
+
+    The inserted code imports NeMo RL only when ``NRL_VLLM_COMPILE_CACHE_TYPE``
+    is set, so a patched vLLM still works in processes without NeMo RL (such
+    as external serving containers). Applied when persistent compile caches
+    are configured (``NRL_CACHE_SYNC``), and then required: a vLLM it does not
+    match fails at engine start rather than silently compiling during the
+    copy.
+    """
+    if not os.environ.get(COMPILE_CACHE_SYNC_ENV_VAR):
+        return
+    file_to_patch = _get_vllm_file("v1/executor/ray_executor_v2.py")
+
+    marker = "NeMo-RL: worker init hook"
+    old_snippet = (
+        "        self.local_rank = local_rank\n"
+        "        super().__init__(\n"
+        "            local_rank=local_rank,\n"
+        "            **self._init_kwargs,\n"
+        "        )\n"
+    )
+    new_snippet = (
+        "        self.local_rank = local_rank\n"
+        "        # NeMo-RL: worker init hook (nemo_rl/models/generation/vllm/\n"
+        "        # worker_init_hook.py): wait for this node's compile cache copy.\n"
+        '        if os.environ.get("NRL_VLLM_COMPILE_CACHE_TYPE"):\n'
+        "            from nemo_rl.models.generation.vllm.worker_init_hook import (\n"
+        "                on_ray_worker_init as _nrl_on_ray_worker_init,\n"
+        "            )\n"
+        "\n"
+        "            _nrl_on_ray_worker_init()\n"
+        "        super().__init__(\n"
+        "            local_rank=local_rank,\n"
+        "            **self._init_kwargs,\n"
+        "        )\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM RayWorkerProc init hook patch already applied.")
+            return
+        if content.count(old_snippet) != 1:
+            raise RuntimeError(
+                "Persistent compile caches are on (NRL_CACHE_SYNC) but the "
+                "RayWorkerProc init hook patch does not match "
+                f"{file_to_patch}; the vLLM version changed. Update "
+                "_patch_vllm_ray_worker_proc_init_hook."
+            )
+        write_back(content.replace(old_snippet, new_snippet, 1))
+    logger.info("Patched vLLM RayWorkerProc to run NeMo RL's worker init hook.")
 
 
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
@@ -1267,6 +1332,7 @@ def _apply_vllm_patches(
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
+    _patch_vllm_ray_worker_proc_init_hook(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)

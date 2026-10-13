@@ -151,6 +151,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -572,6 +573,9 @@ class MegatronPolicyWorkerImpl(
         del num_gpus_per_node  # not needed; one GPU per worker
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        # Trainer-only JIT cache directories (NRL_MEGATRON_<VAR>), separate from
+        # generation's; see nemo_rl/utils/compile_cache.py.
+        env_vars.update(compile_cache.env_overrides("MEGATRON"))
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 
@@ -593,6 +597,11 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Copy the trainer's persistent compile cache onto this node in the
+        # background (no-op unless configured): its kernels are first compiled
+        # at the first logprob or training step, well after init.
+        compile_cache.seed(compile_cache.MEGATRON_CACHE_TYPE, background=True)
+
         self.is_refit_destination = is_refit_destination
         self.refit_payload_mode: RefitPayloadMode = "hf_export"
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
