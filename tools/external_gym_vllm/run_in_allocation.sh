@@ -41,6 +41,29 @@ fi
 RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
+# Image for the load-balancer steps. Every pool's load balancer is its own srun
+# step on the Ray head node and creates its own container, so with the default
+# the head node unpacks one extra copy of CONTAINER per pool next to the Ray
+# head's own, which delays the Ray cluster. vllm_pool_lb.py needs only Python and
+# aiohttp; README.md describes a small image. EXTERNAL_VLLM_LB_CONTAINER_PYTHON
+# is that image's interpreter.
+EXTERNAL_VLLM_LB_CONTAINER="${EXTERNAL_VLLM_LB_CONTAINER:-${CONTAINER}}"
+if [[ "${EXTERNAL_VLLM_LB_CONTAINER}" == "${CONTAINER}" ]]; then
+  if [[ -n "${EXTERNAL_VLLM_LB_CONTAINER_PYTHON:-}" ]]; then
+    echo "[FATAL] EXTERNAL_VLLM_LB_CONTAINER_PYTHON applies only when EXTERNAL_VLLM_LB_CONTAINER names another image; use EXTERNAL_VLLM_LB_PYTHON for CONTAINER" >&2
+    exit 1
+  fi
+  lb_python="${EXTERNAL_VLLM_LB_PYTHON}"
+else
+  lb_python="${EXTERNAL_VLLM_LB_CONTAINER_PYTHON:-/usr/local/bin/python3}"
+  # Pyxis reads an image starting with / or . as a squashfs file; anything else
+  # is a registry reference that it imports.
+  if [[ "${EXTERNAL_VLLM_LB_CONTAINER}" == [/.]* && ! -r "${EXTERNAL_VLLM_LB_CONTAINER}" ]]; then
+    echo "[FATAL] EXTERNAL_VLLM_LB_CONTAINER is not readable: ${EXTERNAL_VLLM_LB_CONTAINER}" >&2
+    exit 1
+  fi
+  echo "[INFO] Load balancers use ${EXTERNAL_VLLM_LB_CONTAINER} (${lb_python})"
+fi
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
 EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS:-5}"
 EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS:-10}"
@@ -596,7 +619,7 @@ for pool in "${pool_names[@]}"; do
     --het-group=0 \
     --no-container-mount-home \
     --container-name="external-vllm-lb-${pool,,}-${SLURM_JOB_ID}" \
-    --container-image="${CONTAINER}" \
+    --container-image="${EXTERNAL_VLLM_LB_CONTAINER}" \
     --container-mounts="${lb_mounts}" \
     --container-workdir="${SLURM_SUBMIT_DIR}" \
     --mpi=pmix \
@@ -608,7 +631,7 @@ for pool in "${pool_names[@]}"; do
     --ntasks=1 \
     --cpus-per-task=2 \
     --output="${pool_log_dirs[${pool}]}/load_balancer.log" \
-    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
+    bash -lc "PYTHON='${lb_python}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
   lb_step_pids+=("$!")
   lb_step_labels+=("${display_names[${pool}]} load balancer")
 

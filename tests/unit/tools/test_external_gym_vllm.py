@@ -773,6 +773,169 @@ def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
     assert '--port "${VLLM_HTTP_PORT}"' in source
 
 
+def _run_launcher_with_fake_slurm(
+    tmp_path: Path, env_overrides: dict[str, str] | None = None
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]], Path]:
+    """Run run_in_allocation.sh with fake srun, scontrol, getent, and ray.sub.
+
+    Two pools of one replica each. Every fake srun records its argv and exits at
+    once, so the wrapper stops at its first startup check after launching all
+    replica and load-balancer steps.
+
+    Returns:
+        The finished wrapper process, the argv of every srun call, and the
+        BASE_LOG_DIR the wrapper creates once validation has passed.
+    """
+    shared_root = tmp_path / "shared"
+    shared_root.mkdir()
+    tools_dir = shared_root / "tools"
+    tools_dir.symlink_to(REPO_ROOT / "tools/external_gym_vllm")
+    srun_calls = tmp_path / "srun_calls"
+    srun_calls.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_commands = {
+        "srun": f'printf "%s\\0" "$@" > "$(mktemp {srun_calls}/call.XXXXXX)"',
+        "scontrol": "tr , '\\n' <<< \"$3\"",
+        "getent": 'echo "10.0.0.1 STREAM $2"',
+    }
+    for name, body in fake_commands.items():
+        fake_command = bin_dir / name
+        fake_command.write_text(f"#!/bin/bash\n{body}\n")
+        fake_command.chmod(0o755)
+    ray_sub = tmp_path / "ray.sub"
+    ray_sub.write_text("exit 0\n")
+
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "SLURM_JOB_ID": "123",
+        "SLURM_HET_SIZE": "2",
+        "SLURM_JOB_NODELIST_HET_GROUP_0": "ray01",
+        "SLURM_JOB_NODELIST_HET_GROUP_1": "judge01,judge02",
+        "SLURM_JOB_ACCOUNT": "account",
+        "SLURM_JOB_PARTITION": "partition",
+        "SLURM_SUBMIT_DIR": str(tmp_path),
+        "BASE_LOG_DIR": str(shared_root / "logs"),
+        "CONTAINER": "training.sqsh",
+        "MOUNTS": f"{shared_root}:{shared_root}",
+        "COMMAND": "run __GENRM_BASE_URL__ __JUDGE_BASE_URL__ __EXTERNAL_SERVICE_READINESS__",
+        "EXTERNAL_VLLM_POOLS": "GENRM JUDGE",
+        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(tools_dir),
+        "EXTERNAL_VLLM_SHARED_ROOT": str(shared_root),
+        "RAY_SUB": str(ray_sub),
+    }
+    for index, pool in enumerate(("GENRM", "JUDGE")):
+        env |= {
+            f"{pool}_CONTAINER": f"{pool.lower()}.sqsh",
+            f"{pool}_MODEL": "model-id",
+            f"{pool}_VLLM_PYTHON": "/opt/python",
+            f"{pool}_REPLICAS": "1",
+            f"{pool}_TENSOR_PARALLEL_SIZE": "4",
+            f"{pool}_LB_PORT": str(9213 + index),
+            f"{pool}_URL_PLACEHOLDER": f"__{pool}_BASE_URL__",
+        }
+    env |= env_overrides or {}
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    calls = [call.read_text().split("\0")[:-1] for call in sorted(srun_calls.iterdir())]
+    return result, calls, shared_root / "logs"
+
+
+def _load_balancer_steps(calls: list[list[str]]) -> list[list[str]]:
+    lb_steps = [call for call in calls if "--het-group=0" in call]
+    for call in lb_steps:
+        assert call[-3:-1] == ["bash", "-lc"]
+        assert "/opt/external-vllm-tools/lb_watchdog.sh" in call[-1]
+    return lb_steps
+
+
+def test_load_balancers_run_from_nemo_rl_container_by_default(tmp_path: Path) -> None:
+    result, calls, _ = _run_launcher_with_fake_slurm(tmp_path)
+
+    lb_steps = _load_balancer_steps(calls)
+    assert len(lb_steps) == 2, result.stderr
+    for call in lb_steps:
+        assert "--container-image=training.sqsh" in call
+        assert call[-1].startswith("PYTHON='/opt/nemo_rl_venv/bin/python' ")
+    assert "Load balancers use" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("squashfs", "lb_python", "expected_python"),
+    [
+        pytest.param(True, None, "/usr/local/bin/python3", id="squashfs"),
+        pytest.param(False, "/opt/lb/bin/python", "/opt/lb/bin/python", id="registry"),
+    ],
+)
+def test_load_balancers_run_from_lb_container_with_its_python(
+    tmp_path: Path, squashfs: bool, lb_python: str | None, expected_python: str
+) -> None:
+    if squashfs:
+        (tmp_path / "lb.sqsh").touch()
+        lb_image = str(tmp_path / "lb.sqsh")
+    else:
+        lb_image = "registry#team/lb:1"
+    overrides = {"EXTERNAL_VLLM_LB_CONTAINER": lb_image}
+    if lb_python is not None:
+        overrides["EXTERNAL_VLLM_LB_CONTAINER_PYTHON"] = lb_python
+
+    result, calls, _ = _run_launcher_with_fake_slurm(tmp_path, overrides)
+
+    lb_steps = _load_balancer_steps(calls)
+    assert len(lb_steps) == 2, result.stderr
+    for call in lb_steps:
+        assert f"--container-image={lb_image}" in call
+        assert call[-1].startswith(f"PYTHON='{expected_python}' ")
+    replica_images = sorted(
+        argument
+        for call in calls
+        if "--het-group=1" in call
+        for argument in call
+        if argument.startswith("--container-image=")
+    )
+    assert replica_images == [
+        "--container-image=genrm.sqsh",
+        "--container-image=judge.sqsh",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param(
+            {"EXTERNAL_VLLM_LB_CONTAINER": "{tmp_path}/missing.sqsh"},
+            "EXTERNAL_VLLM_LB_CONTAINER is not readable: {tmp_path}/missing.sqsh",
+            id="unreadable-squashfs",
+        ),
+        pytest.param(
+            {"EXTERNAL_VLLM_LB_CONTAINER_PYTHON": "/usr/local/bin/python3"},
+            "EXTERNAL_VLLM_LB_CONTAINER_PYTHON applies only when "
+            "EXTERNAL_VLLM_LB_CONTAINER names another image",
+            id="python-without-lb-container",
+        ),
+    ],
+)
+def test_lb_container_misconfiguration_fails_before_any_step(
+    tmp_path: Path, overrides: dict[str, str], message: str
+) -> None:
+    env_overrides = {
+        name: value.format(tmp_path=tmp_path) for name, value in overrides.items()
+    }
+
+    result, calls, log_root = _run_launcher_with_fake_slurm(tmp_path, env_overrides)
+
+    assert result.returncode == 1
+    assert f"[FATAL] {message.format(tmp_path=tmp_path)}" in result.stderr
+    assert calls == []
+    assert not log_root.exists()
+
+
 def test_pool_config_interface_registers_an_arbitrary_third_pool():
     script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
     program = textwrap.dedent(

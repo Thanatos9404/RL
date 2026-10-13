@@ -118,7 +118,7 @@ Required variables:
 |---|---|
 | `BASE_LOG_DIR` | Parent under `EXTERNAL_VLLM_SHARED_ROOT` for `<job-id>-logs`. |
 | `COMMAND` | NeMo RL command containing every pool's URL placeholder and `__EXTERNAL_SERVICE_READINESS__` among the training script's arguments. The wrapper replaces that token with the `++env.nemo_gym.external_service_readiness=...` override; it is required so the override cannot land after a trailing pipe or comment. |
-| `CONTAINER` | NeMo RL and load-balancer container. |
+| `CONTAINER` | NeMo RL container; also the load-balancer container unless `EXTERNAL_VLLM_LB_CONTAINER` is set. |
 | `MOUNTS` | Mount list required by `ray.sub` and `COMMAND`. |
 | `EXTERNAL_VLLM_POOLS` | Ordered pool names; this order determines node slicing. |
 | `EXTERNAL_VLLM_TOOLS_DIR_HOST` | Path to this directory under `EXTERNAL_VLLM_SHARED_ROOT`. |
@@ -129,7 +129,9 @@ Optional globals:
 |---|---|---|
 | `GPUS_PER_NODE` | `4` | GPUs claimed per node. Set this before registering pools; it sizes hetgroup 1 and is exported to `ray.sub`, so it must match the physical GPUs per node for both components. |
 | `NUM_EXTERNAL_SERVICE_NODES` | empty | Expected hetgroup 1 node count. Pass it to `validate_external_vllm_submission` to fail before `sbatch` on a topology mismatch; validation warns and skips this check when unset. |
-| `EXTERNAL_VLLM_LB_PYTHON` | `/opt/nemo_rl_venv/bin/python` | Python with `aiohttp` in `CONTAINER`. |
+| `EXTERNAL_VLLM_LB_PYTHON` | `/opt/nemo_rl_venv/bin/python` | Python with `aiohttp` in `CONTAINER`; used while `EXTERNAL_VLLM_LB_CONTAINER` is unset. |
+| `EXTERNAL_VLLM_LB_CONTAINER` | `CONTAINER` | Image for the per-pool load-balancer steps. Set it to a small Python and `aiohttp` image so the Ray head node does not unpack an extra copy of `CONTAINER` per pool; see [Load-balancer image](#load-balancer-image). A value starting with `/` or `.` is a squashfs path and must be readable when the job starts. |
+| `EXTERNAL_VLLM_LB_CONTAINER_PYTHON` | `/usr/local/bin/python3` | Python with `aiohttp` in `EXTERNAL_VLLM_LB_CONTAINER`. Setting it without `EXTERNAL_VLLM_LB_CONTAINER` is an error. |
 | `RAY_SUB` | `$SLURM_SUBMIT_DIR/ray.sub` | Normal NeMo RL Slurm entrypoint. |
 | `EXTERNAL_VLLM_SHARED_ROOT` | `/lustre` | Shared host path mounted at the same path in every external-service container. |
 | `EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS` | `5` | How often the NeMo Gym actor rechecks external load-balancer health. |
@@ -188,7 +190,59 @@ server. This avoids importing NeMo RL's policy modules and training dependency
 stack into a purpose-built serving container. If the source checkout is not
 available, the wrapper falls back to the installed `nemo_rl` package.
 `CONTAINER` must provide
-`EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
+`EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed, unless
+`EXTERNAL_VLLM_LB_CONTAINER` runs the load balancers from another image.
+
+### Load-balancer image
+
+Each pool's load balancer runs as its own `srun` step on the NeMo RL Ray head
+node, and each step creates its own container. With the default
+`EXTERNAL_VLLM_LB_CONTAINER=$CONTAINER`, the head node therefore unpacks one
+extra copy of the training image per pool next to the Ray head's own copy. With
+a large image this can make the head node the last node to come up, which delays
+the whole Ray cluster. A small image avoids this.
+
+The load-balancer step runs
+`bash -lc "PYTHON=... /opt/external-vllm-tools/lb_watchdog.sh ..."`, so the
+image needs:
+
+- `bash` at `/bin/bash` and the coreutils `date`, `dirname`, and `sleep`, used
+  by `lb_watchdog.sh`;
+- Python 3.10 or newer at `EXTERNAL_VLLM_LB_CONTAINER_PYTHON`;
+  `vllm_pool_lb.py` otherwise imports only the standard library; and
+- `aiohttp` importable by that Python. `pyproject.toml` requires
+  `aiohttp>=3.13.3`.
+
+The Debian-based `python:3.13-slim` image from Docker Hub has everything except
+`aiohttp`, and its interpreter is `/usr/local/bin/python3`, the default for
+`EXTERNAL_VLLM_LB_CONTAINER_PYTHON`. Alpine-based images do not ship `bash`.
+With Docker, a two-line Dockerfile is enough:
+
+```dockerfile
+FROM python:3.13-slim
+RUN pip install --no-cache-dir 'aiohttp>=3.13.3'
+```
+
+```bash
+docker build -t external-vllm-lb .
+enroot import -o external-vllm-lb.sqsh dockerd://external-vllm-lb
+```
+
+Without Docker, enroot alone can add `aiohttp` to the imported image:
+
+```bash
+enroot import -o python-slim.sqsh docker://python:3.13-slim
+enroot create -n external-vllm-lb python-slim.sqsh
+enroot start --root --rw external-vllm-lb \
+  pip install --no-cache-dir 'aiohttp>=3.13.3'
+enroot export -o external-vllm-lb.sqsh external-vllm-lb
+enroot remove -f external-vllm-lb
+```
+
+The resulting squashfs is a few tens of MB. Put it on a path every node can
+read and set `EXTERNAL_VLLM_LB_CONTAINER` to it. The load-balancer steps still
+apply `MOUNTS` and use `SLURM_SUBMIT_DIR` as their working directory, as they do
+with `CONTAINER`.
 
 ## Slurm submission
 
