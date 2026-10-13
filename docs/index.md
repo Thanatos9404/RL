@@ -344,6 +344,7 @@ guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
+guides/persistent-jit-caches.md
 ```
 
 ```{toctree}
