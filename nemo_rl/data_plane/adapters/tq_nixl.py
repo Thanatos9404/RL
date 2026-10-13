@@ -266,6 +266,13 @@ class NixlKVClient(StorageKVClient):
             or os.environ.get("NVDP_CHECK_FINITE") == "1"
         )
         if kind == "unit":
+            ssd = ssd_config(cfg)
+            # A blob is one region of one unit's put area (the slab minus SSD
+            # staging); a put bigger than max_blob_bytes is split at key
+            # boundaries into several blobs, so it fits a unit with room to spare.
+            area = int(cfg.get("unit_slab_bytes", 1 << 30))
+            area -= ssd["staging_bytes"] if ssd else 0
+            self.max_blob_bytes = int(cfg.get("max_blob_bytes", area // 4))
             pl = _as_dict(cfg.get("placement") or {})
             self.store = make_store(
                 "unit",
@@ -277,7 +284,7 @@ class NixlKVClient(StorageKVClient):
                 ),
                 node_id=ray.get_runtime_context().get_node_id(),
                 timeout_s=self.timeout_s,
-                ssd=ssd_config(cfg) is not None,
+                ssd=ssd is not None,
             )
         else:
             self.store = make_store(
@@ -299,16 +306,36 @@ class NixlKVClient(StorageKVClient):
         deadline = time.monotonic() + self.op_timeout_s
         with self._errors(keys):
             if isinstance(self.store, UnitSlabStore):
-                blob_id = uuid.uuid4().hex
-                # The blob id rides in the footer tag so RPC-free readers can verify it.
-                p = blob_format.plan(keys, values, tag=bytes.fromhex(blob_id))
-                blob_id, extra = self._put_segments(p, blob_id, deadline)
-            else:  # file store: one contiguous blob
-                p = blob_format.plan(keys, values)
-                with self._acquire(p.nbytes, deadline) as (base, buf):
-                    blob_format.write(p, memoryview(buf)[: p.nbytes])
-                    with self._lock:
-                        blob_id, extra = self.store.put(base, p, deadline)
+                return self._put_split(keys, list(values), deadline)
+            # file store: one contiguous blob
+            p = blob_format.plan(keys, values)
+            with self._acquire(p.nbytes, deadline) as (base, buf):
+                blob_format.write(p, memoryview(buf)[: p.nbytes])
+                with self._lock:
+                    blob_id, extra = self.store.put(base, p, deadline)
+        return [{"b": blob_id, **e.meta(), **extra} for e in p.entries]
+
+    def _put_split(
+        self, keys: list[str], values: list[Any], deadline: float
+    ) -> list[dict[str, Any]]:
+        """Put as one blob, halving at key boundaries while over max_blob_bytes.
+
+        Every key's meta names its own blob, so readers need nothing new. If a
+        later part fails, the parts already written are released.
+        """
+        blob_id = uuid.uuid4().hex
+        # The blob id rides in the footer tag so RPC-free readers can verify it.
+        p = blob_format.plan(keys, values, tag=bytes.fromhex(blob_id))
+        if p.nbytes > self.max_blob_bytes and len(keys) > 1:
+            h = len(keys) // 2
+            first = self._put_split(keys[:h], values[:h], deadline)
+            try:
+                return first + self._put_split(keys[h:], values[h:], deadline)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    self.clear(keys[:h], first)
+                raise
+        blob_id, extra = self._put_segments(p, blob_id, deadline)
         return [{"b": blob_id, **e.meta(), **extra} for e in p.entries]
 
     def _acquire(self, nbytes: int, deadline: float):

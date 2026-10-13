@@ -879,7 +879,11 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
 
         nixl_cfg = backend_config(cfg)
         block = nixl_cfg.model_dump()
-        block.pop("storage_unit_placement", None)
+        placement = block.pop("storage_unit_placement", "all")
+        if placement != "all" and not block.get("node_ids"):
+            block["node_ids"] = _simple_storage_node_ids(placement)
+            if not block["node_ids"]:
+                raise RuntimeError(f"no nodes for storage_unit_placement={placement!r}")
         overlay = {
             **controller_overlay,
             "backend": {"storage_backend": "NixlStore", "NixlStore": block},

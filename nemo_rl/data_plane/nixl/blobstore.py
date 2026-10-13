@@ -314,7 +314,15 @@ class UnitSlabStore:
                         nbytes=int(nbytes),
                         n_entries=int(n_entries),
                     )
-                except (UnitFull, DataPlaneBusy, TransferError, LostBlobs) as e:
+                except TransferError as e:
+                    # No reply in time: the unit may still allocate. Nothing
+                    # was posted, so it can free the region whenever it does.
+                    self.ctl.notify(
+                        self._addr(unit_id), "abort", blob_id=blob_id, in_flight=False
+                    )
+                    errs.append(e)
+                    continue
+                except (UnitFull, DataPlaneBusy, LostBlobs) as e:
                     errs.append(e)
                     continue
                 u = self._unit(unit_id)

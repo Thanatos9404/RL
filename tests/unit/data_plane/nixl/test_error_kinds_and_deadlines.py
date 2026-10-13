@@ -224,6 +224,14 @@ def test_deadline_spent_after_alloc_frees_the_region_at_once():
     assert all(a.get("in_flight") is False for op, a in ctl.notified if op == "abort")
 
 
+def test_unanswered_alloc_tells_the_unit_to_free_the_region():
+    ctl = _Ctl({"alloc": lambda a: TransferError("did not answer alloc")})
+    with pytest.raises(TransferFailed):
+        _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    aborts = [a for op, a in ctl.notified if op == "abort"]
+    assert aborts and all(a == {"blob_id": "b", "in_flight": False} for a in aborts)
+
+
 # ------------------------------------------------------------------ config (§3.3)
 def test_read_pin_must_cover_a_transfer_plus_margin():
     assert tq_nixl.check_timeouts({}) == (120.0, 150.0, 240.0)

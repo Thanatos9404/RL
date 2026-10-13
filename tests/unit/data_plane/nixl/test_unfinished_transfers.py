@@ -157,6 +157,16 @@ def test_pool_reuses_buffers_after_a_clean_op():
     assert pool.retired == []
 
 
+def test_eviction_while_the_only_cached_oversize_buffer_is_in_use():
+    ep = _FakeEp()
+    pool = BufferPool(ep, threading.Lock(), base_bytes=1024, max_oversize_bytes=8192)
+    with pool.acquire(4096):
+        pass
+    with pool.acquire(4096):  # takes the cached one: its bucket is now empty
+        with pool.acquire(8192) as (_, buf):  # over budget: must evict, not crash
+            assert buf.nbytes == 8192
+
+
 def test_failed_replacement_shrinks_the_pool_and_never_hangs():
     ep = _FakeEp()
     pool = BufferPool(ep, threading.Lock(), base_bytes=1024, base_count=1)
@@ -262,6 +272,46 @@ def test_zero_copy_source_is_deregistered_after_a_clean_put():
     c._put_segments(p, "b", time.monotonic() + 60)
     assert zc.data_ptr() not in ep.registered
     assert c.retained_sources == [] and c.pool.retired == []
+
+
+def test_put_over_max_blob_bytes_is_split_at_key_boundaries():
+    import torch
+
+    blobs = []
+
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
+        blobs.append((blob_id, nbytes, n_entries))
+        return blob_id, {"u": 0}
+
+    c, _ = _client_with(put_segments)
+    c.max_blob_bytes = 10_000  # 4 KiB values: at most 2 per blob
+    keys = [f"k{i}" for i in range(5)]
+    metas = c._put_split(keys, [torch.ones(1024)] * 5, time.monotonic() + 60)
+    assert len(metas) == 5 and len(blobs) == 3
+    assert all(n <= c.max_blob_bytes for _, n, _ in blobs)
+    assert sum(k for _, _, k in blobs) == 5
+    assert {m["b"] for m in metas} == {b for b, _, _ in blobs}
+
+
+def test_failed_part_of_a_split_put_releases_the_parts_written():
+    import torch
+
+    from nemo_rl.data_plane.nixl.errors import UnitFull
+
+    calls, released = [], []
+
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
+        calls.append(blob_id)
+        if len(calls) == 2:
+            raise UnitFull("no unit could take it")
+        return blob_id, {"u": 0}
+
+    c, _ = _client_with(put_segments)
+    c.store.release = lambda counts, hints=None: released.append(counts)
+    c.max_blob_bytes = 5_000  # one 4 KiB value per blob
+    with pytest.raises(UnitFull):
+        c._put_split(["a", "b"], [torch.ones(1024)] * 2, time.monotonic() + 60)
+    assert released == [{calls[0]: 1}]
 
 
 def _store_with(ep_transfer_error: TransferError):

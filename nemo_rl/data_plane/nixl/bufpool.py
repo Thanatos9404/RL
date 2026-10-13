@@ -148,7 +148,10 @@ class BufferPool:
             bucket = self._oversize_free.get(size)
             if bucket:
                 item = bucket.pop()
-                self._oversize_free.move_to_end(size)
+                if bucket:
+                    self._oversize_free.move_to_end(size)
+                else:  # eviction pops from listed buckets: never list an empty one
+                    del self._oversize_free[size]
                 self.stats["oversize_hits"] += 1
         if item is None:
             self._evict_for(size)
