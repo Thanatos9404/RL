@@ -18,11 +18,15 @@
   and, when seeding is on, the cache type their GPU workers wait for.
 * ``_patch_vllm_ray_worker_proc_init_hook`` makes RayExecutorV2 GPU workers run
   that wait before they compile.
+* ``_patch_vllm_compile_factors_ignore_bundle_indices`` gives engines that
+  differ only in their GPUs one compile cache key.
 """
 
 import ast
+import importlib.util
 import logging
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -41,6 +45,18 @@ CACHE_SYNC = REPO_ROOT / "tools/external_gym_vllm/cache_sync.sh"
 _HOOK_SOURCE = "v1/executor/ray_executor_v2.py"
 _HOOK_PATCH_FN = "_patch_vllm_ray_worker_proc_init_hook"
 _HOOK_MARKER = "NeMo-RL: worker init hook"
+_FACTORS_SOURCE = "envs.py"
+_FACTORS_PATCH_FN = "_patch_vllm_compile_factors_ignore_bundle_indices"
+# The shape of vllm/envs.py's ignored_factors set that the patch extends.
+_SYNTHETIC_ENVS = """\
+def compile_factors():
+    ignored_factors: set[str] = {
+        "MAX_JOBS",
+        "VLLM_PORT",
+        "VLLM_CACHE_ROOT",
+    }
+    return ignored_factors
+"""
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -210,3 +226,84 @@ def test_init_hook_patch_fails_loudly_on_unknown_source(
     with pytest.raises(RuntimeError, match="init hook patch does not match"):
         patches._patch_vllm_ray_worker_proc_init_hook(_LOGGER)
     assert source.read_text() == "class RayWorkerProc:\n    pass\n"
+
+
+def _load_module(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(f"envs_{path.parent.name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.vllm
+def test_bundle_indices_drop_out_of_the_compile_cache_key(
+    monkeypatch, tmp_path, seeding_enabled
+):
+    unpatched = write_unpatched_copy(
+        _FACTORS_SOURCE, _FACTORS_PATCH_FN, tmp_path / "unpatched/envs.py"
+    )
+    patched = write_unpatched_copy(
+        _FACTORS_SOURCE, _FACTORS_PATCH_FN, tmp_path / "patched/envs.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(patched))
+
+    patches._patch_vllm_compile_factors_ignore_bundle_indices(_LOGGER)
+
+    def factors(source: Path, bundle_indices: str) -> dict[str, object]:
+        monkeypatch.setenv("VLLM_RAY_BUNDLE_INDICES", bundle_indices)
+        return _load_module(source).compile_factors()
+
+    # Two engines placed on different GPUs of the same placement group.
+    assert factors(unpatched, "0,1,2,3") != factors(unpatched, "4,5,6,7")
+    assert factors(patched, "0,1,2,3") == factors(patched, "4,5,6,7")
+    assert "VLLM_RAY_BUNDLE_INDICES" not in factors(patched, "0,1,2,3")
+
+
+def test_bundle_indices_patch_is_idempotent(monkeypatch, tmp_path, seeding_enabled):
+    source = tmp_path / "envs.py"
+    source.write_text(_SYNTHETIC_ENVS)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    patches._patch_vllm_compile_factors_ignore_bundle_indices(_LOGGER)
+    once = source.read_text()
+    patches._patch_vllm_compile_factors_ignore_bundle_indices(_LOGGER)
+
+    assert source.read_text() == once
+    assert "VLLM_RAY_BUNDLE_INDICES" in _load_module(source).compile_factors()
+
+
+def test_bundle_indices_patch_leaves_an_upstream_fix_alone(
+    monkeypatch, tmp_path, seeding_enabled
+):
+    source = tmp_path / "envs.py"
+    upstream = _SYNTHETIC_ENVS.replace(
+        '        "VLLM_PORT",\n',
+        '        "VLLM_PORT",\n        "VLLM_RAY_BUNDLE_INDICES",\n',
+    )
+    source.write_text(upstream)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    patches._patch_vllm_compile_factors_ignore_bundle_indices(_LOGGER)
+
+    assert source.read_text() == upstream
+
+
+def test_bundle_indices_patch_is_skipped_without_persistent_caches(monkeypatch):
+    def _unexpected(_relative):
+        raise AssertionError("must not touch vLLM without NRL_CACHE_SYNC")
+
+    monkeypatch.setattr(patches, "_get_vllm_file", _unexpected)
+
+    patches._patch_vllm_compile_factors_ignore_bundle_indices(_LOGGER)
+
+
+def test_bundle_indices_patch_fails_loudly_on_unknown_source(
+    monkeypatch, tmp_path, seeding_enabled
+):
+    source = tmp_path / "envs.py"
+    source.write_text("def compile_factors():\n    return {}\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with pytest.raises(RuntimeError, match="compile-factors patch does not match"):
+        patches._patch_vllm_compile_factors_ignore_bundle_indices(_LOGGER)

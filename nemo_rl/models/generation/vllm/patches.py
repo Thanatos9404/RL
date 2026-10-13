@@ -587,6 +587,57 @@ def _patch_vllm_ray_worker_proc_init_hook(logger) -> None:
     logger.info("Patched vLLM RayWorkerProc to run NeMo RL's worker init hook.")
 
 
+def _patch_vllm_compile_factors_ignore_bundle_indices(logger) -> None:
+    """Keep ``VLLM_RAY_BUNDLE_INDICES`` out of vLLM's compile cache keys.
+
+    ``vllm.envs.compile_factors()`` hashes every known ``VLLM_*`` variable that
+    is not in its ``ignored_factors`` set into the key of the torch.compile
+    cache (``compilation/backends.py``, ``compilation/caching.py``) and of the
+    FlashInfer autotune cache (``model_executor/warmup/
+    flashinfer_autotune_cache.py``). NeMo RL sets ``VLLM_RAY_BUNDLE_INDICES``
+    per engine to place it on its GPUs, so every engine got its own keys: a
+    persistent cache written by one engine never hit for the others, and each
+    run compiled and tuned once per engine. Which GPUs
+    an engine uses does not change what it compiles, so add the variable to
+    the ignored factors, next to ``VLLM_PORT`` (still hashed in vLLM 0.29.0).
+    Skipped when vLLM already ignores it. Applied when persistent compile
+    caches are configured (``NRL_CACHE_SYNC``), so the cache keys of other runs
+    do not change, and then required.
+    """
+    if not os.environ.get(COMPILE_CACHE_SYNC_ENV_VAR):
+        return
+    file_to_patch = _get_vllm_file("envs.py")
+
+    marker = "NeMo-RL: GPU placement is not part of the compile cache key"
+    already_ignored = '        "VLLM_RAY_BUNDLE_INDICES",'
+    old_snippet = '        "VLLM_PORT",\n'
+    new_snippet = (
+        '        "VLLM_PORT",\n'
+        '        "VLLM_RAY_BUNDLE_INDICES",  # NeMo-RL: GPU placement is not part '
+        "of the compile cache key\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM compile-factors patch already applied.")
+            return
+        if already_ignored in content:
+            logger.info(
+                "vLLM already keeps VLLM_RAY_BUNDLE_INDICES out of its compile "
+                "cache key; NeMo-RL compile-factors patch not needed."
+            )
+            return
+        if content.count(old_snippet) != 1:
+            raise RuntimeError(
+                "Persistent compile caches are on (NRL_CACHE_SYNC) but the "
+                f"compile-factors patch does not match {file_to_patch}; the vLLM "
+                "version changed. Update "
+                "_patch_vllm_compile_factors_ignore_bundle_indices."
+            )
+        write_back(content.replace(old_snippet, new_snippet, 1))
+    logger.info("Patched vLLM compile factors to ignore VLLM_RAY_BUNDLE_INDICES.")
+
+
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
@@ -1333,6 +1384,7 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_ray_worker_proc_init_hook(patch_logger)
+    _patch_vllm_compile_factors_ignore_bundle_indices(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
