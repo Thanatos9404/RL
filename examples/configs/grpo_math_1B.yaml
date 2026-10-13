@@ -202,6 +202,7 @@ policy:
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
+      parallel_read_threads: 1  # >1 reads torch_dist checkpoint files with N threads per rank on load
     # Compute next-token logprobs directly from hidden states with a chunked
     # linear cross-entropy fusion, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends

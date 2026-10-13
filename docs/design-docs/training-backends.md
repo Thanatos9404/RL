@@ -188,3 +188,16 @@ policy:
 ```
 
 This is equivalent to deleting the converted checkpoint directory and rerunning — the old checkpoint will be overwritten with a freshly converted one.
+
+### Parallel Checkpoint Reads ###
+
+PyTorch's `FileSystemReader` reads each rank's share of a `torch_dist` checkpoint one item at a time from a single stream. On parallel filesystems that one request in flight per rank can leave most of the storage bandwidth unused. To read with several threads per rank instead, set:
+
+```yaml
+policy:
+  megatron_cfg:
+    checkpoint:
+      parallel_read_threads: 4  # Default: 1 (PyTorch's reader)
+```
+
+Each rank then reads its checkpoint files in 16 MB requests from that many threads, at most 1 GiB ahead of the item being deserialized; deserialization and the copy into the model stay on the loading thread, in file order. The setting covers every `torch_dist` load in the worker process (the policy, its reference model, and resumes); Megatron value models use `value.megatron_cfg.checkpoint.parallel_read_threads`. It works by replacing `FileSystemReader.read_data` inside the worker, so it supports only torch versions whose reader matches the one it was written against (currently 2.11 through 2.13) and raises at setup otherwise; set it back to 1 to use PyTorch's reader.

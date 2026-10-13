@@ -355,7 +355,11 @@ class MegatronConfigDisabled(TypedDict):
 
 
 class MegatronCheckpointConfig(TypedDict, total=False):
-    """Checkpoint knobs passed through to Megatron Bridge CheckpointConfig."""
+    """Megatron checkpoint knobs.
+
+    All fields except ``parallel_read_threads`` are passed through to Megatron
+    Bridge's CheckpointConfig.
+    """
 
     # Offload disk writes to a persistent background worker so save_checkpoint
     # returns after D2H staging.
@@ -367,6 +371,13 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+    # Applied by NeMo RL, not by Bridge: threads each rank uses to read torch_dist
+    # checkpoint files on load (16 MB requests, up to 1 GiB read ahead;
+    # deserialization and the copy into the model stay on one thread). Integer >= 1.
+    # 1 (the exemplar default) keeps PyTorch's single-stream FileSystemReader; 4 is a
+    # reasonable start on parallel filesystems. Supported torch versions are checked
+    # at setup; see nemo_rl/models/megatron/ckpt_parallel_read.py.
+    parallel_read_threads: int
 
 
 class MegatronConfig(TypedDict):

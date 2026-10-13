@@ -85,6 +85,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     resolve_boundary_ignore_patterns,
 )
+from nemo_rl.models.megatron import ckpt_parallel_read
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
@@ -2353,6 +2354,11 @@ def setup_model_and_optimizer(
 ):
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
+    # Opt-in parallel reads for torch_dist loads. Process-wide, so the reference
+    # model and any later load in this worker use them too.
+    ckpt_cfg = policy_cfg["megatron_cfg"].get("checkpoint")
+    if ckpt_cfg is not None and "parallel_read_threads" in ckpt_cfg:
+        ckpt_parallel_read.install(ckpt_cfg["parallel_read_threads"])
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
