@@ -924,6 +924,136 @@ def test_replica_worker_node_fails_when_patching_fails(tmp_path):
     assert events == ["apply patches"]
 
 
+def _pool_cache_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
+    persistent = tmp_path / "persistent"
+    (persistent / "vllm").mkdir(parents=True)
+    (persistent / "vllm/entry").write_text("compiled by an earlier job")
+    return {
+        "TEST_CACHE_DIR": str(persistent),
+        "EXTERNAL_VLLM_LOCAL_CACHE_ROOT": str(tmp_path / "local"),
+        # The sidecar outlives nothing here; keep its last sleep short.
+        "CACHE_SYNC_INTERVAL": "1",
+        **overrides,
+    }
+
+
+def test_replica_seeds_pool_cache_before_ray_starts(tmp_path):
+    result, events = _run_replica_node(
+        tmp_path, procid=1, extra_env=_pool_cache_env(tmp_path)
+    )
+
+    assert result.returncode == 0, result.stderr
+    local_vllm = tmp_path / "local/test/vllm"
+    assert events == [
+        "apply patches",
+        f"ray start VLLM_CACHE_ROOT={local_vllm} seeded=yes",
+    ]
+    assert (tmp_path / "local/test.seeded").exists()
+
+
+def test_replica_force_fresh_compiles_from_scratch(tmp_path):
+    result, events = _run_replica_node(
+        tmp_path,
+        procid=1,
+        extra_env=_pool_cache_env(tmp_path, CACHE_FORCE_FRESH="1"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        events[-1] == f"ray start VLLM_CACHE_ROOT={tmp_path}/local/test/vllm seeded=no"
+    )
+    # Marked seeded anyway, so the sidecar still publishes what this run compiles.
+    assert (tmp_path / "local/test.seeded").exists()
+
+
+@pytest.mark.parametrize("with_cache", [False, True])
+def test_replica_head_keeps_cache_paths_over_pool_env(tmp_path, with_cache):
+    extra_env = _pool_cache_env(tmp_path) if with_cache else {}
+
+    result, events = _run_replica_node(tmp_path, procid=0, extra_env=extra_env)
+
+    # The fake server exits at once, which the head reports as a failure.
+    assert result.returncode == 1
+    assert "vLLM exited with status 0" in result.stderr
+    expected = f"{tmp_path}/local/test/flashinfer" if with_cache else "/tmp"
+    assert f"vllm serve FLASHINFER_WORKSPACE_BASE={expected}" in events
+
+
+def test_launcher_requires_pool_cache_dir_under_shared_root():
+    script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
+    env = {
+        "PATH": os.environ["PATH"],
+        "SLURM_JOB_ID": "123",
+        "SLURM_HET_SIZE": "2",
+        "SLURM_JOB_NODELIST_HET_GROUP_0": "ray[01-02]",
+        "SLURM_JOB_NODELIST_HET_GROUP_1": "genrm01",
+        "SLURM_JOB_ACCOUNT": "account",
+        "SLURM_JOB_PARTITION": "partition",
+        "SLURM_SUBMIT_DIR": str(REPO_ROOT),
+        "BASE_LOG_DIR": str(REPO_ROOT / "logs"),
+        "CONTAINER": "training.sqsh",
+        "MOUNTS": "/lustre:/lustre",
+        "COMMAND": "run __GENRM_BASE_URL__ __EXTERNAL_SERVICE_READINESS__",
+        "EXTERNAL_VLLM_POOLS": "GENRM",
+        "EXTERNAL_VLLM_SHARED_ROOT": str(REPO_ROOT),
+        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(REPO_ROOT / "tools/external_gym_vllm"),
+        "GENRM_CONTAINER": "genrm.sqsh",
+        "GENRM_MODEL": "model-id",
+        "GENRM_VLLM_PYTHON": "/opt/python",
+        "GENRM_REPLICAS": "1",
+        "GENRM_TENSOR_PARALLEL_SIZE": "4",
+        "GENRM_LB_PORT": "9213",
+        "GENRM_URL_PLACEHOLDER": "__GENRM_BASE_URL__",
+        "GENRM_CACHE_DIR": "/elsewhere/compile_cache/genrm",
+        "RAY_SUB": str(REPO_ROOT / "ray.sub"),
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert (
+        "Path must be under " + str(REPO_ROOT) + " for the external-service "
+        "container mount: /elsewhere/compile_cache/genrm"
+    ) in result.stderr
+
+
+def test_pool_registration_exports_a_validated_cache_dir():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        set -euo pipefail
+        source {script}
+        EXTERNAL_VLLM_SHARED_ROOT=/shared
+        register_external_vllm_pool WITH_CACHE \\
+          --model model --container image --python /opt/python \\
+          --replicas 1 --tensor-parallel-size 4 \\
+          --lb-port 9213 --url-placeholder __WITH_CACHE_URL__ \\
+          --cache-dir /shared/compile_cache/judge
+        register_external_vllm_pool WITHOUT_CACHE \\
+          --model model --container image --python /opt/python \\
+          --replicas 1 --tensor-parallel-size 4 \\
+          --lb-port 9214 --url-placeholder __WITHOUT_CACHE_URL__
+        bash -c 'printf "%s|%s\\n" "$WITH_CACHE_CACHE_DIR" "$WITHOUT_CACHE_CACHE_DIR"'
+        """
+    )
+    outside_root = program.replace(
+        "/shared/compile_cache/judge", "/elsewhere/compile_cache/judge"
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", program], capture_output=True, text=True, check=True
+    )
+    rejected = subprocess.run(
+        ["bash", "-c", outside_root], capture_output=True, text=True
+    )
+
+    assert result.stdout == "/shared/compile_cache/judge|\n"
+    assert rejected.returncode == 2
+    assert "WITH_CACHE_CACHE_DIR must be under /shared" in rejected.stderr
+
+
 def test_pool_config_interface_registers_an_arbitrary_third_pool():
     script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
     program = textwrap.dedent(

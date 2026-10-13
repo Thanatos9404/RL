@@ -130,6 +130,7 @@ register_external_vllm_pool() {
   local served_model_name="model"
   local vllm_port="8000"
   local startup_timeout="3600"
+  local cache_dir=""
   local -a shared_paths=()
 
   while (( $# > 0 )); do
@@ -147,6 +148,7 @@ register_external_vllm_pool() {
       --vllm-port) vllm_port="${2:?value required for $1}"; shift 2 ;;
       --startup-timeout) startup_timeout="${2:?value required for $1}"; shift 2 ;;
       --shared-path) shared_paths+=("${2:?value required for $1}"); shift 2 ;;
+      --cache-dir) cache_dir="${2:?value required for $1}"; shift 2 ;;
       *)
         echo "ERROR: unknown register_external_vllm_pool option: $1" >&2
         return 2
@@ -185,6 +187,9 @@ register_external_vllm_pool() {
   for shared_path in "${shared_paths[@]}"; do
     _external_vllm_require_shared_path "${pool}_SHARED_PATHS" "${shared_path}" || return
   done
+  if [[ -n "${cache_dir}" ]]; then
+    _external_vllm_require_shared_path "${pool}_CACHE_DIR" "${cache_dir}" || return
+  fi
 
   local existing existing_lb_var existing_placeholder_var
   local -a existing_pools=()
@@ -213,6 +218,7 @@ register_external_vllm_pool() {
   _external_vllm_set "${pool}" SERVED_MODEL_NAME "${served_model_name}"
   _external_vllm_set "${pool}" VLLM_PORT "${vllm_port}"
   _external_vllm_set "${pool}" STARTUP_TIMEOUT "${startup_timeout}"
+  _external_vllm_set "${pool}" CACHE_DIR "${cache_dir}"
   if [[ -n "${group_id}" ]]; then
     _external_vllm_set "${pool}" GROUP_ID "${group_id}"
   fi
@@ -276,7 +282,7 @@ validate_external_vllm_submission() {
     fi
     _external_vllm_require_shared_path "${variable_name}" "${path}" || return
   done
-  for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
+  for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py cache_sync.sh; do
     if [[ ! -f "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" ]]; then
       echo "ERROR: missing ${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" >&2
       return 2

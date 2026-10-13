@@ -91,6 +91,7 @@ The generated fields are:
 | `POOL_VLLM_PORT` | no | `8000` | Backend HTTP port; replicas use disjoint private clusters. |
 | `POOL_STARTUP_TIMEOUT` | no | `3600` | Seconds allowed for startup. |
 | `POOL_SHARED_PATHS` | no | empty | Newline-separated absolute paths under `EXTERNAL_VLLM_SHARED_ROOT` that the pool container must access. |
+| `POOL_CACHE_DIR` | no | empty | Persistent compile-cache directory under `EXTERNAL_VLLM_SHARED_ROOT`, set with `--cache-dir`. Empty disables it. See [Persistent compile caches](#persistent-compile-caches). |
 | `POOL_ENV_VARS` | no | empty | Newline-separated `NAME=value` assignments applied before vLLM starts. |
 | `POOL_VLLM_ARGS` | no | empty | Newline-separated vLLM CLI arguments, one argv entry per line. |
 
@@ -135,6 +136,10 @@ Optional globals:
 | `EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS` | `5` | How often the NeMo Gym actor rechecks external load-balancer health. |
 | `EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS` | `10` | Per-request timeout for the NeMo Gym external-health probes. |
 | `DEDICATED_RAY_HEAD` | unset | Passed through to `ray.sub`. With `1`, include one extra node in hetgroup 0 while keeping `cluster.num_nodes` equal to the GPU worker-node count; the head node's GPUs remain allocated but idle. |
+| `EXTERNAL_VLLM_LOCAL_CACHE_ROOT` | `/tmp/nemo_rl_compile_cache` | Node-local parent of the per-pool cache copies (`<root>/<pool-name-lowercase>`). Only used by pools with `POOL_CACHE_DIR`. |
+| `CACHE_SYNC_INTERVAL` | `60` | Seconds between write-back passes of a pool's compile cache. |
+| `CACHE_SYNC_MIN_AGE_MIN` | `1` | A compiled file is written back only after it has not changed for this many minutes. |
+| `CACHE_FORCE_FRESH` | unset | With `1`, pools with `POOL_CACHE_DIR` start from an empty cache (cold-start measurement); what they compile is still written back. |
 
 The number of nodes in hetgroup 1 must equal:
 
@@ -170,17 +175,18 @@ reserved for this helper.
 ## Filesystem and container requirements
 
 External replicas mount `EXTERNAL_VLLM_SHARED_ROOT` at the same path inside the
-container. Therefore `BASE_LOG_DIR`, `EXTERNAL_VLLM_TOOLS_DIR_HOST`, and
-absolute local model paths must be under that root. A Hugging Face model ID is
-also accepted.
+container. Therefore `BASE_LOG_DIR`, `EXTERNAL_VLLM_TOOLS_DIR_HOST`,
+`POOL_CACHE_DIR`, and absolute local model paths must be under that root. A
+Hugging Face model ID is also accepted.
 
 Each pool container must provide:
 
 - its configured `POOL_VLLM_PYTHON`;
 - importable `ray` and `vllm` packages in that environment;
 - access to the matching NeMo RL source checkout, or an importable `nemo_rl`
-  package as a fallback; and
-- the `ray` command on `PATH`.
+  package as a fallback;
+- the `ray` command on `PATH`; and
+- `rsync` and `flock` on `PATH` if the pool sets `POOL_CACHE_DIR`.
 
 `serve_vllm_on_ray.py` loads NeMo RL's vLLM compatibility patch module directly
 from the matching source checkout and applies it before importing the vLLM API
@@ -192,6 +198,16 @@ before `ray start`, because their vLLM workers import vLLM from their own
 container; a replica fails if that does not succeed.
 `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
+
+## Persistent compile caches
+
+A pool registered with `--cache-dir <dir>` keeps its JIT compile caches across jobs in `<dir>` on the shared filesystem, laid out as `{vllm,inductor,triton,flashinfer,fa4_cute}`. On every node of every replica, before Ray starts:
+
+1. `cache_sync.sh seed-once` copies `<dir>` to `$EXTERNAL_VLLM_LOCAL_CACHE_ROOT/<pool-name-lowercase>` on the node;
+2. the replica points `VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, `FLASHINFER_WORKSPACE_BASE` and `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` at that copy, so the Ray-spawned vLLM workers inherit them; the head node applies them again after the pool's `ENV_VARS`, which therefore cannot override them;
+3. `cache_sync.sh sidecar` publishes new files back to `<dir>` every `CACHE_SYNC_INTERVAL` seconds, never replacing an existing file and skipping files changed in the last `CACHE_SYNC_MIN_AGE_MIN` minutes.
+
+FlashAttention-4 keeps no disk cache unless the pool sets `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` in its environment. Give each pool its own directory: every node of the pool copies the whole directory, and although entries are keyed by hashes of the model, engine settings and software versions (so sharing is safe), a shared directory makes each pool copy the others' entries too. See `docs/guides/persistent-jit-caches.md` for the write-back rules, the NeMo RL side (policy and trainer caches) and caveats.
 
 ## Slurm submission
 
