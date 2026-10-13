@@ -1105,7 +1105,7 @@ class AutomodelPolicyWorkerImpl(
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
 
         self.maybe_init_zmq()
@@ -1143,7 +1143,7 @@ class AutomodelPolicyWorkerImpl(
         """
         if target_precision != "bf16":
             raise NotImplementedError(
-                "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+                "The Automodel policy only supports BF16 SGLang refits; "
                 f"got target_precision={target_precision!r}."
             )
         del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
@@ -1215,7 +1215,7 @@ class AutomodelPolicyWorkerImpl(
     ) -> None:
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
 
         # Manually move model to cuda for cpu offload case
