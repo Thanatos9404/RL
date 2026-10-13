@@ -15,6 +15,7 @@
 import ast
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -56,6 +57,39 @@ def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
         namespace["_load_apply_vllm_patches"]()
         leaked = [m for m in sys.modules if m.partition(".")[0] == "nemo_rl"]
         assert not leaked, leaked
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_serve_wrapper_can_apply_patches_without_starting_vllm():
+    """Non-head replica nodes patch their own container's vLLM this way."""
+    script = REPO_ROOT / "tools/external_gym_vllm/serve_vllm_on_ray.py"
+    program = textwrap.dedent(
+        f"""
+        import runpy
+        import sys
+        import types
+
+        def _forbidden(**kwargs):
+            raise AssertionError("ray.init must not run with --apply-patches-only")
+
+        fake_ray = types.ModuleType("ray")
+        fake_ray.init = _forbidden
+        sys.modules["ray"] = fake_ray
+        main = runpy.run_path({str(script)!r})["main"]
+        applied = []
+        main.__globals__["_load_apply_vllm_patches"] = lambda: applied.append
+        sys.argv = [{str(script)!r}, "--apply-patches-only"]
+        main()
+        assert applied == [sys.executable], applied
         """
     )
 
@@ -771,6 +805,123 @@ def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
     assert source.count('--max-worker-port="${MAX_WORKER_PORT}"') == 2
     assert 'export VLLM_PORT="${VLLM_ENGINE_PORT}"' in source
     assert '--port "${VLLM_HTTP_PORT}"' in source
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.write_text(textwrap.dedent(body))
+    path.chmod(0o755)
+
+
+def _replica_server_body() -> str:
+    source = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+    start_marker = "<<'VLLM_SERVER_BODY_EOF'\n"
+    start = source.index(start_marker) + len(start_marker)
+    return source[start : source.index("\nVLLM_SERVER_BODY_EOF\n", start)]
+
+
+def _run_replica_node(
+    tmp_path: Path, *, procid: int, extra_env: dict[str, str] | None = None
+) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run one node of a replica's server script with fake Ray and vLLM.
+
+    Returns the result and the events the fakes recorded, in order: patching,
+    `ray start` with the compile-cache environment Ray workers would inherit,
+    and `vllm serve` with the environment the engine would see.
+    """
+    events = tmp_path / "events.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "ray",
+        f"""\
+        #!/bin/bash
+        if [[ "$1" == "start" ]]; then
+          seeded=no
+          [[ -e "${{VLLM_CACHE_ROOT-}}/entry" ]] && seeded=yes
+          echo "ray start VLLM_CACHE_ROOT=${{VLLM_CACHE_ROOT-}} seeded=${{seeded}}" >> {events}
+        fi
+        """,
+    )
+    # The head publishes `hostname -I`; keep the test independent of the host.
+    _write_executable(
+        bin_dir / "hostname",
+        """\
+        #!/bin/bash
+        [[ "${1-}" == "-I" ]] && echo 127.0.0.1 || echo replica-node
+        """,
+    )
+    # A worker node idles in `tail -f /dev/null`; end it at once instead.
+    _write_executable(
+        bin_dir / "tail",
+        f"""\
+        #!/bin/bash
+        [[ "$*" == "-f /dev/null" ]] && exit 0
+        exec {shutil.which("tail")} "$@"
+        """,
+    )
+    fake_python = tmp_path / "python"
+    _write_executable(
+        fake_python,
+        f"""\
+        #!/bin/bash
+        case "${{2-}}" in
+          --apply-patches-only)
+            echo "apply patches" >> {events}
+            exit "${{FAKE_PATCH_EXIT:-0}}"
+            ;;
+          serve)
+            echo "vllm serve FLASHINFER_WORKSPACE_BASE=${{FLASHINFER_WORKSPACE_BASE-}}" >> {events}
+            ;;
+        esac
+        exit 0
+        """,
+    )
+    head_ip_file = tmp_path / "head_ip"
+    if procid != 0:
+        head_ip_file.write_text("127.0.0.1\n")
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "SLURM_PROCID": str(procid),
+        "POOL_PREFIX": "TEST",
+        "REPLICA_ID": "test-0",
+        "EXTERNAL_VLLM_TOOLS_DIR": str(REPO_ROOT / "tools/external_gym_vllm"),
+        "EXTERNAL_VLLM_STATE_DIR": str(tmp_path),
+        "EXTERNAL_VLLM_GROUP_ID": "test",
+        "HEAD_IP_FILE": str(head_ip_file),
+        "LOG_FILE": str(tmp_path / "vllm.log"),
+        "TEST_MODEL": "model",
+        "TEST_VLLM_PYTHON": str(fake_python),
+        "TEST_VLLM_PORT": "8000",
+        "TEST_TENSOR_PARALLEL_SIZE": "8",
+        "TEST_ENV_VARS": "FLASHINFER_WORKSPACE_BASE=/tmp",
+    }
+    env.update(extra_env or {})
+    result = subprocess.run(
+        ["bash", "-c", _replica_server_body()],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result, events.read_text().splitlines() if events.exists() else []
+
+
+def test_replica_worker_node_applies_vllm_patches_before_joining_ray(tmp_path):
+    result, events = _run_replica_node(tmp_path, procid=1)
+
+    assert result.returncode == 0, result.stderr
+    assert events == ["apply patches", "ray start VLLM_CACHE_ROOT= seeded=no"]
+
+
+def test_replica_worker_node_fails_when_patching_fails(tmp_path):
+    result, events = _run_replica_node(
+        tmp_path, procid=1, extra_env={"FAKE_PATCH_EXIT": "1"}
+    )
+
+    assert result.returncode == 1
+    assert "applying NeMo RL's vLLM patches on this node failed" in result.stderr
+    assert events == ["apply patches"]
 
 
 def test_pool_config_interface_registers_an_arbitrary_third_pool():

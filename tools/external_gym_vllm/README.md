@@ -186,7 +186,10 @@ Each pool container must provide:
 from the matching source checkout and applies it before importing the vLLM API
 server. This avoids importing NeMo RL's policy modules and training dependency
 stack into a purpose-built serving container. If the source checkout is not
-available, the wrapper falls back to the installed `nemo_rl` package.
+available, the wrapper falls back to the installed `nemo_rl` package. The other
+nodes of a multi-node replica run `serve_vllm_on_ray.py --apply-patches-only`
+before `ray start`, because their vLLM workers import vLLM from their own
+container; a replica fails if that does not succeed.
 `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
