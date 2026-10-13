@@ -79,8 +79,14 @@ def packed_broadcast_producer(
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
-        # Synchronize the current stream
-        streams[buffer_idx].synchronize()
+        # Join every side stream before this buffer is reused. Waiting only on
+        # the buffer's own stream let the export of the next buffer (on the
+        # other stream) overlap the in-flight broadcast of this one, and with a
+        # multi-node trainer (FSDP2 full_tensor all-gathers in the iterator) the
+        # receivers got corrupted weights. Receiving still overlaps with the
+        # consumer's unpack/load; only the producer-side overlap is given up.
+        for stream in streams:
+            stream.synchronize()
         # Start tasks for the new buffer in a new stream
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             try:
@@ -192,8 +198,12 @@ def _packed_broadcast_consumer_batches(
         while True:
             # Move to the next buffer
             buffer_idx = (buffer_idx + 1) % num_buffers
-            # Synchronize the current stream before its buffer is reused.
-            streams[buffer_idx].synchronize()
+            # Join every side stream before this buffer is reused: the weight
+            # loader may still be reading yielded slices of it from the other
+            # buffer's stream (deferred weight_loader replays), and the next
+            # broadcast would otherwise overwrite them.
+            for stream in streams:
+                stream.synchronize()
             with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
                 # Initialize the packing tensor meta data
                 packing_tensor_meta_data[buffer_idx] = []
