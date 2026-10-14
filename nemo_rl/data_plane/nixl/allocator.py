@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
+from typing import Callable
 
 from nemo_rl.data_plane.nixl.errors import UnitFull
 
@@ -39,13 +40,19 @@ class _Range:
 
 
 class SlabAllocator:
-    def __init__(self, capacity: int, align: int = 64) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        align: int = 64,
+        on_free: Callable[[int, int], None] | None = None,
+    ) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
         if align <= 0 or (align & (align - 1)):
             raise ValueError("align must be a positive power of two")
         self.capacity = capacity
         self.align = align
+        self.on_free = on_free  # (off, nbytes) of each region back on the free list
         self._free: list[_Range] = [
             _Range(0, capacity)
         ]  # sorted by off, non-overlapping
@@ -75,6 +82,8 @@ class SlabAllocator:
         size = align_up(nbytes, self.align)
         if off < 0 or off + size > self.capacity:
             raise ValueError(f"free out of range: off={off} size={size}")
+        if self.on_free is not None:
+            self.on_free(off, nbytes)
         r = _Range(off, size)
         i = bisect.bisect_left(self._free, r)
         # merge with right neighbour

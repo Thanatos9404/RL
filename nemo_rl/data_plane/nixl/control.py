@@ -38,6 +38,7 @@ Protocol ``TransferError``                   any other server exception
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import uuid
@@ -52,6 +53,8 @@ from nemo_rl.data_plane.nixl.errors import (
     TransferError,
     UnitFull,
 )
+
+log = logging.getLogger(__name__)
 
 _enc = msgspec.msgpack.Encoder()
 _dec = msgspec.msgpack.Decoder()
@@ -144,6 +147,8 @@ class UnitServer:
                 op, rid, args = _dec.decode(payload)
             except Exception:  # noqa: BLE001
                 continue
+            if not isinstance(op, str):  # unhashable op would kill this thread
+                continue
             fn = self.handlers.get(op)
             try:
                 if fn is None:
@@ -155,8 +160,8 @@ class UnitServer:
             if op not in NO_REPLY:
                 try:
                     self.sock.send_multipart([ident, _enc.encode([rid, ok, result])])
-                except zmq.ZMQError:
-                    pass
+                except Exception:  # noqa: BLE001 - unencodable result; keep serving
+                    log.exception("could not reply to %s", op)
 
     def close(self) -> None:
         self._stop.set()
@@ -204,7 +209,16 @@ class UnitClient:
             timeout_ms = max(1, min(timeout_ms, int(timeout_s * 1000)))
         rid = uuid.uuid4().hex[:12]
         s = self._sock(address)
-        s.send(_enc.encode([op, rid, args]))
+        # A unit that stopped reading fills the send queue: wait no longer
+        # than the reply would be waited for.
+        s.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        try:
+            s.send(_enc.encode([op, rid, args]))
+        except zmq.Again:
+            raise TransferError(
+                f"unit {address} send queue stayed full for {op} "
+                f"({timeout_ms / 1000:.1f}s)"
+            ) from None
         while True:
             if not s.poll(timeout_ms, zmq.POLLIN):
                 self._drop(address)  # a late reply must not reach the next caller

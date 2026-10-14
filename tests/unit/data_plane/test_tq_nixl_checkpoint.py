@@ -156,3 +156,52 @@ def test_restore_refuses_other_store_kind(ray_cluster):
     with pytest.raises(Exception, match="store="):
         tq2.load_checkpoint(str(ckpt))
     _teardown(tq2, conf)
+
+
+def test_restore_reads_all_shards_at_once_and_spills_what_does_not_fit(monkeypatch):
+    """Each round sends every shard to its next unit before waiting on any;
+    a blob its home unit has no room for moves on to the next unit."""
+    from types import SimpleNamespace
+
+    from nemo_rl.data_plane.adapters import tq_nixl_checkpoint as ck
+
+    events: list[tuple] = []
+
+    class Unit:
+        def __init__(self, u, room):
+            self.u, self.room = u, room
+            self.load_shard = SimpleNamespace(remote=self._load)
+
+        def _load(self, path, blobs):
+            events.append(("send", self.u, path))
+            loaded, failed = [], []
+            for b in blobs:
+                (loaded if self.room > 0 else failed).append(b)
+                self.room -= b in loaded
+            return {"loaded": loaded, "failed": failed}
+
+    units = {0: Unit(0, room=1), 1: Unit(1, room=10)}
+    put = []
+    store = SimpleNamespace(
+        directory=SimpleNamespace(put_blobs=SimpleNamespace(remote=put.extend)),
+        _blob_unit={},
+    )
+
+    def get(x):
+        events.append(("wait",))
+        return x
+
+    monkeypatch.setattr(ck, "_active_units", lambda s: [0, 1])
+    monkeypatch.setattr(ck, "_unit_actor", lambda s, u: units[u])
+    monkeypatch.setattr(ck, "ray", SimpleNamespace(get=get))
+    manifest = {
+        "shards": [
+            {"file": "unit-0.shard", "blobs": {"a": [0, 8, 1], "b": [8, 8, 1]}},
+            {"file": "unit-1.shard", "blobs": {"c": [0, 8, 1]}},
+        ]
+    }
+    ck._load_units(store, Path("/ckpt"), manifest)
+
+    assert [e[0] for e in events[:2]] == ["send", "send"]  # both shards before a wait
+    assert store._blob_unit == {"a": 0, "c": 1, "b": 1}
+    assert sorted(put) == sorted(store._blob_unit.items())

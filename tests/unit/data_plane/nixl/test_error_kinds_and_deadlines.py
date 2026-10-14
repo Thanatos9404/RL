@@ -107,6 +107,24 @@ def test_reply_wait_honours_the_callers_budget(server):
         cli.close()
 
 
+def test_malformed_op_does_not_stop_the_unit_serving(server):
+    import zmq
+
+    ctx = zmq.Context()
+    bad = ctx.socket(zmq.DEALER)
+    bad.setsockopt(zmq.LINGER, 0)
+    bad.connect(server.address)
+    bad.send(control._enc.encode([[1], "x", {}]))  # unhashable op
+    cli = control.UnitClient(timeout_s=5)
+    try:
+        with pytest.raises(UnitFull):
+            cli.call(server.address, "full")
+    finally:
+        cli.close()
+        bad.close(0)
+        ctx.term()
+
+
 def test_pre_structured_error_replies_still_raise():
     with pytest.raises(TransferError, match="KeyError"):
         control.raise_reply("tcp://x", "op", ["KeyError", "oops"])
@@ -230,6 +248,22 @@ def test_unanswered_alloc_tells_the_unit_to_free_the_region():
         _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
     aborts = [a for op, a in ctl.notified if op == "abort"]
     assert aborts and all(a == {"blob_id": "b", "in_flight": False} for a in aborts)
+
+
+def test_unreachable_agent_after_alloc_frees_the_region():
+    class _NoAgent(_Ep):
+        def has_remote(self, name):
+            return False
+
+        def add_remote(self, md):
+            raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+
+    ctl = _Ctl({"alloc": lambda a: 0})
+    with pytest.raises(TransferFailed):
+        _store(ctl, ep=_NoAgent()).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    aborts = [a for op, a in ctl.notified if op == "abort"]
+    assert len(aborts) == ctl.calls.count("alloc")
+    assert all(a == {"blob_id": "b", "in_flight": False} for a in aborts)
 
 
 # ------------------------------------------------------------------ config (§3.3)

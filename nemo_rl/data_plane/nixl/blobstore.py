@@ -325,7 +325,14 @@ class UnitSlabStore:
                 except (UnitFull, DataPlaneBusy, LostBlobs) as e:
                     errs.append(e)
                     continue
-                u = self._unit(unit_id)
+                try:
+                    u = self._unit(unit_id)
+                except LostBlobs as e:  # NIXL cannot reach it: nothing was posted
+                    self.ctl.notify(
+                        self._addr(unit_id), "abort", blob_id=blob_id, in_flight=False
+                    )
+                    errs.append(e)
+                    continue
                 base = int(u["slab_base"]) + off
                 try:
                     left = remaining(deadline, self.timeout_s)

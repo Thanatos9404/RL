@@ -221,14 +221,14 @@ class NixlStorageUnit:
         self._victims: set[str] = set()  # victims whose slab copy is still held
         self._staged: dict[str, BlobRec] = {}  # blobs with a staged copy
         if not ssd_dir:
-            self.alloc_ = SlabAllocator(slab_bytes)
+            self.alloc_ = SlabAllocator(slab_bytes, on_free=self._wipe_footer)
             return
         main = (slab_bytes - staging_bytes) // 4096 * 4096
         if staging_bytes <= 0 or main <= 0:
             raise ValueError(
                 f"ssd staging_bytes={staging_bytes} must be in (0, slab {slab_bytes})"
             )
-        self.alloc_ = SlabAllocator(main)
+        self.alloc_ = SlabAllocator(main, on_free=self._wipe_footer)
         self.staging_ = SlabAllocator(slab_bytes - main)
         self.staging_base = main
         self.ssd_dir = os.path.join(
@@ -337,8 +337,9 @@ class NixlStorageUnit:
                 return
             rec.holds += 1  # a release now defers the free to us
         # The file is unlinked at once and kept by its fd: nothing is left on
-        # the node's disk when the unit dies, however it dies.
-        path = os.path.join(self.ssd_dir, f"{b}.blob")
+        # the node's disk when the unit dies, however it dies. Named by a fresh
+        # uuid, not the client-supplied blob id, so no id can steer the path.
+        path = os.path.join(self.ssd_dir, f"{uuid.uuid4().hex}.blob")
         fd = None
         ok = True
         try:
@@ -348,7 +349,7 @@ class NixlStorageUnit:
             done = 0
             while done < rec.nbytes:
                 done += os.pwrite(fd, view[done:], done)
-        except OSError as e:
+        except Exception as e:  # noqa: BLE001 - anything else would leave the hold
             ok = False
             log.warning("unit %d: demoting %s failed: %s", self.unit_id, b, e)
         with self._mu:
@@ -446,7 +447,7 @@ class NixlStorageUnit:
                 if not n:
                     raise OSError(f"short read staging {b}")
                 done += n
-        except OSError as e:
+        except Exception as e:  # noqa: BLE001 - anything else would leave staging set
             ok = False
             log.error("unit %d: staging %s failed: %s", self.unit_id, b, e)
         now = time.monotonic()
@@ -604,9 +605,15 @@ class NixlStorageUnit:
         # Always quarantine for read_pin_s, pinned or not: clients read with
         # cached (unit, offset) hints and no pin RPC, so a freed region must not
         # be reused while such a read could still be in flight. The blob tag in
-        # the footer catches anything older than that.
+        # the footer catches anything older than that: _wipe_footer clears it
+        # before the region can be reused (a smaller blob would not overwrite it).
         at = max(rec.pin_expiry(now), now + self.read_pin_s)
         _free_at(self.alloc_, rec.off, rec.nbytes, at, now)
+
+    def _wipe_footer(self, off: int, nbytes: int) -> None:
+        """Zero a freed blob's footer so a stale hinted read fails its tag check."""
+        if nbytes >= blob_format.FOOTER_SIZE:
+            self.slab[off + nbytes - blob_format.FOOTER_SIZE : off + nbytes] = 0
 
     @_locked
     def release_many(self, items: list[tuple[str, int]]) -> None:

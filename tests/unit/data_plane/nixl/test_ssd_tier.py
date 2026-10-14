@@ -244,6 +244,31 @@ def test_failed_demotion_is_not_retried_so_a_full_disk_ends_in_unitfull(
     assert u.stats()["demote_failures"] == 6
 
 
+def test_unexpected_demotion_error_fails_like_a_disk_error(tmp_path, monkeypatch):
+    u = _unit(tmp_path)
+    _fill(u)
+
+    def bug(*a):
+        raise ValueError("not an OSError")
+
+    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", bug)
+    with pytest.raises(UnitFull):  # not Busy forever on a stuck victim
+        _alloc_eventually(u, "new")
+    assert u.stats()["demote_failures"] == 6
+    assert all(r.holds == 0 and not r.victim for r in u.blobs.values())
+
+
+def test_freed_region_loses_its_footer():
+    from nemo_rl.data_plane.nixl.blob_format import FOOTER_SIZE
+
+    u = bare_unit(1 << 16)  # read_pin_s=0: freed at once
+    off = u.alloc("a", 1000, 1)
+    u.slab[off : off + 1000] = 7
+    u.release("a", 1)
+    assert not u.slab[off + 1000 - FOOTER_SIZE : off + 1000].any()
+    assert u.slab[off] == 7  # only the footer is wiped
+
+
 def test_checkpoint_is_refused_with_ssd_on(tmp_path):
     u = _unit(tmp_path)
     with pytest.raises(NotImplementedError):

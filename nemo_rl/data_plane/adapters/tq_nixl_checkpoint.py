@@ -172,20 +172,31 @@ def _load_units(store: UnitSlabStore, root: Path, manifest: dict[str, Any]) -> N
         raise RuntimeError("no ACTIVE NixlStorageUnit to restore into")
     placed: list[tuple[str, int]] = []
     # Shard i starts on unit i (mod n); whatever does not fit spills to the next
-    # unit in order, so N units restore onto N±k units without a planner.
-    for i, shard in enumerate(manifest["shards"]):
-        pending = dict(shard["blobs"])
-        path = str(root / shard["file"])
-        order = units[i % len(units) :] + units[: i % len(units)]
-        for u in order:
-            if not pending:
-                break
-            r = ray.get(_unit_actor(store, u).load_shard.remote(path, pending))
-            placed.extend((b, u) for b in r["loaded"])
-            pending = {b: pending[b] for b in r["failed"]}
-        if pending:
+    # unit in order, so N units restore onto N±k units without a planner. Each
+    # round sends every shard with blobs left to its next unit at once, so the
+    # restore takes about one unit's read instead of the sum over units.
+    shards = manifest["shards"]
+    paths = [str(root / s["file"]) for s in shards]
+    orders = [
+        units[i % len(units) :] + units[: i % len(units)] for i in range(len(shards))
+    ]
+    pending = [dict(s["blobs"]) for s in shards]
+    for k in range(len(units)):
+        futs = {
+            i: _unit_actor(store, orders[i][k]).load_shard.remote(paths[i], pending[i])
+            for i in range(len(shards))
+            if pending[i]
+        }
+        if not futs:
+            break
+        for i, f in futs.items():
+            r = ray.get(f)
+            placed.extend((b, orders[i][k]) for b in r["loaded"])
+            pending[i] = {b: pending[i][b] for b in r["failed"]}
+    for shard, left in zip(shards, pending):
+        if left:
             raise UnitFull(
-                f"{len(pending)} blob(s) of shard {shard['file']} fit on no ACTIVE unit"
+                f"{len(left)} blob(s) of shard {shard['file']} fit on no ACTIVE unit"
             )
     ray.get(store.directory.put_blobs.remote(placed))
     for b, u in placed:
