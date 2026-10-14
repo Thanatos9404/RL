@@ -25,8 +25,8 @@ class TrtllmSpecificArgs(TypedDict):
     precision: str
     # With precision="fp8", use MXFP8 (UE8M0 1x32 scales) instead of 128x128 block-FP8.
     is_mx: NotRequired[bool]
-    # With precision="fp8", modules kept in BF16 (fnmatch / "re:" patterns, same key
-    # as vllm_cfg). Unset: routed experts only. lm_head and embeddings always stay BF16.
+    # With precision="fp8", modules kept in BF16 (fnmatch / "re:" patterns). Unlike
+    # vllm_cfg, unset means routed experts only and a list replaces that default.
     quantization_ignore_patterns: NotRequired[list[str]]
     max_batch_size: int
     max_num_tokens: int
