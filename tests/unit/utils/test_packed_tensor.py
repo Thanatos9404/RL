@@ -302,3 +302,113 @@ def test_packed_broadcast_multiple_batches():
     total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors)
     expected_total_size = sum(t.numel() * t.element_size() for _, t in params)
     assert total_broadcasted_size == expected_total_size
+
+
+class _RecordingStream(torch.cuda.Stream):
+    """CUDA stream that logs its own ``synchronize`` calls."""
+
+    def synchronize(self):
+        self.sync_log.append(id(self))
+        return super().synchronize()
+
+
+def _install_recording_streams(monkeypatch):
+    """Make ``torch.cuda.Stream()`` return streams that log ``synchronize``.
+
+    Only the argument-less constructions (the side streams allocated by
+    ``packed_tensor``) are tracked; streams torch builds internally with explicit
+    ids (e.g. ``torch.cuda.current_stream()``) pass through untouched.
+    """
+    events: list = []  # ("sync", stream_id) / ("broadcast",) in program order
+    tracked: list[int] = []
+
+    class _SyncLog(list):
+        def append(self, stream_id):
+            events.append(("sync", stream_id))
+
+    sync_log = _SyncLog()
+    real_stream = torch.cuda.Stream
+
+    def factory(*args, **kwargs):
+        stream = _RecordingStream(*args, **kwargs)
+        if not args and not kwargs:
+            stream.sync_log = sync_log
+            tracked.append(id(stream))
+        else:
+            stream.sync_log = []
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "Stream", factory)
+    assert torch.cuda.Stream is not real_stream
+    return events, tracked
+
+
+def _assert_every_stream_joined_before_each_reuse(events, tracked, num_buffers):
+    """Between two consecutive broadcasts every side stream must be synchronized.
+
+    Reusing a buffer after waiting only on its own stream raced with work that
+    touches the buffer from the other stream (FSDP2 all-gathers of the next
+    export on the producer, deferred weight-loader reads on the consumer) and
+    corrupted multi-node non-colocated refits.
+    """
+    assert len(tracked) == num_buffers
+    broadcasts = [i for i, e in enumerate(events) if e[0] == "broadcast"]
+    assert len(broadcasts) >= 3, "need at least one buffer reuse to be meaningful"
+    for start, end in zip(broadcasts[:-1], broadcasts[1:]):
+        synced = {e[1] for e in events[start:end] if e[0] == "sync"}
+        assert synced == set(tracked), (
+            f"buffer reused after joining only {len(synced)}/{len(tracked)} streams"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_producer_joins_all_streams_before_buffer_reuse(
+    monkeypatch,
+):
+    events, tracked = _install_recording_streams(monkeypatch)
+    params = [(name, t.cuda()) for name, t in create_mock_model_params()]
+
+    class _Group:
+        def broadcast(self, tensor, src):
+            events.append(("broadcast",))
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+        return_value=2000,
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=_Group(),
+            src=0,
+            post_iter_func=lambda x: x[1],
+            num_buffers=2,
+        )
+
+    _assert_every_stream_joined_before_each_reuse(events, tracked, num_buffers=2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_consumer_joins_all_streams_before_buffer_reuse(
+    monkeypatch,
+):
+    events, tracked = _install_recording_streams(monkeypatch)
+    params = [(name, t.cuda()) for name, t in create_mock_model_params()]
+    state_dict_info = create_mock_state_dict_info(params)
+
+    class _Group:
+        def broadcast(self, tensor, src):
+            events.append(("broadcast",))
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+        return_value=2000,
+    ):
+        packed_broadcast_consumer(
+            iterator=iter(state_dict_info.items()),
+            group=_Group(),
+            src=0,
+            post_unpack_func=lambda batch: None,
+            num_buffers=2,
+        )
+
+    _assert_every_stream_joined_before_each_reuse(events, tracked, num_buffers=2)
